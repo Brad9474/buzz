@@ -348,6 +348,7 @@ mod tests {
             "push_gateway_delivery_request_replays",
             "product_feedback",
             "replica_heartbeat",
+            "community_hosts",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -561,7 +562,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 26);
+        assert_eq!(migrations.len(), 27);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -900,12 +901,25 @@ mod tests {
             .contains("CREATE INDEX relay_invites_expires_at_idx ON relay_invites (expires_at)"));
         assert!(!relay_invites.contains("_operator_global_tables"));
 
+        // Preserve main's replica-heartbeat migration byte-for-byte before
+        // adding community host aliases as the next ordered migration.
+        assert_eq!(migrations[25].version, 26);
+        assert!(migrations[25]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE replica_heartbeat"));
+        assert_eq!(migrations[26].version, 27);
+        let community_hosts = migrations[26].sql.as_str();
+        assert!(community_hosts.contains("CREATE TABLE community_hosts"));
+        assert!(community_hosts.contains("REFERENCES communities(id) ON DELETE CASCADE"));
+        assert!(community_hosts.contains("CREATE UNIQUE INDEX idx_community_hosts_host"));
+        assert!(community_hosts.contains("pg_advisory_xact_lock"));
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
             "desired-state schema must include join-policy evidence used by invite claims",
         );
-
         // Replica heartbeat (this branch, renumbered to 0026 after
         // 0025_relay_invites landed on main): the fence's portable read-side
         // observation. A single CHECK'd row makes the token update the
@@ -919,6 +933,9 @@ mod tests {
         assert!(heartbeat.contains("epoch"));
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
+        assert!(desired_schema.contains("CREATE TABLE community_hosts"));
+        assert!(desired_schema.contains("CREATE TRIGGER guard_communities_host_collision"));
+        assert!(desired_schema.contains("CREATE TRIGGER guard_community_hosts_collision"));
     }
 
     #[test]

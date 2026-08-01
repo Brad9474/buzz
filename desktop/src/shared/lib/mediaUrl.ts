@@ -31,6 +31,8 @@ let portPromise: Promise<number | null> | null = null;
  * canonicalized via {@link canonicalOrigin} so comparisons are stable.
  */
 let cachedRelayOrigin: string | null = null;
+/** Exact, relay-advertised host authorities trusted for the active community. */
+let cachedCommunityHosts: Set<string> | null = null;
 
 /**
  * Canonicalize a URL to its origin with a lowercased scheme/host.
@@ -181,6 +183,20 @@ async function fetchProxyPort(): Promise<number | null> {
       }
     }
 
+    if (!cachedCommunityHosts) {
+      try {
+        const hosts = await withDeadline(
+          invoke<string[]>("get_relay_community_hosts"),
+          deadline,
+        );
+        if (hosts !== null && generation === cacheGeneration) {
+          cachedCommunityHosts = new Set(hosts.map((host) => host.toLowerCase()));
+        }
+      } catch {
+        // Older relays do not advertise aliases; origin matching remains the fallback.
+      }
+    }
+
     if (!cachedPort) {
       try {
         const port = await withDeadline(
@@ -229,6 +245,7 @@ export function resetMediaCaches(): void {
   cacheGeneration += 1;
   cachedPort = null;
   portPromise = null;
+  cachedCommunityHosts = null;
   if (cachedRelayOrigin !== null) {
     cachedRelayOrigin = null;
     notifyRelayOriginListeners();
@@ -268,17 +285,19 @@ export function rewriteRelayUrl(url: string): string {
 
   // Only proxy URLs that belong to our relay. External Blossom URLs
   // (different origin) pass through unchanged — they work fine via WKWebView.
-  // If the relay origin isn't cached yet, fall through to the rewrite path
-  // as a safe default (relay URLs need the proxy to avoid Cloudflare 403s).
-  // Compare canonicalized origins: hosts are case-insensitive, and the relay
-  // always returns lowercased media URLs even when the saved community URL
-  // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
-  if (cachedRelayOrigin) {
-    const urlOrigin = canonicalOrigin(url);
-    if (urlOrigin !== cachedRelayOrigin) {
-      return url;
-    }
+  // The configured origin remains the compatibility path for older relays;
+  // aliases are accepted only by exact, case-insensitive authority match.
+  // Until either identity source resolves, fail closed.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return url;
   }
+  const trustedCurrentOrigin = parsed.origin === cachedRelayOrigin;
+  const trustedAlias =
+    cachedCommunityHosts?.has(parsed.host.toLowerCase()) === true;
+  if (!trustedCurrentOrigin && !trustedAlias) return url;
 
   if (cachedPort && cachedPort > 0) {
     return mediaProxyUrl(cachedPort, m[1]);
