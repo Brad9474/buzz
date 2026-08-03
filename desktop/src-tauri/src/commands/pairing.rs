@@ -73,6 +73,7 @@ pub async fn start_pairing(
     app: AppHandle,
     state: State<'_, AppState>,
     pairing: State<'_, PairingHandle>,
+    external_relay_url: Option<String>,
 ) -> Result<String, String> {
     let task_generation = pairing
         .generation
@@ -95,7 +96,10 @@ pub async fn start_pairing(
     let pubkey_hex = keys.public_key().to_hex();
 
     let ws_url = relay_ws_url_with_override(&state);
-    let http_url = relay_api_base_url_with_override(&state);
+    let http_url = resolve_mobile_relay_url(
+        external_relay_url.as_deref(),
+        &relay_api_base_url_with_override(&state),
+    )?;
 
     // NIP-43 relays gate connections on membership, so an unpaired peer can't
     // reach the main relay yet — it must go through the /pair sidecar. Open
@@ -140,6 +144,58 @@ pub async fn start_pairing(
     ));
 
     Ok(qr_uri)
+}
+
+/// Resolve the relay URL persisted by the mobile peer after pairing.
+///
+/// The optional override is transport-only for the phone: the desktop and
+/// managed agents continue using the active workspace relay. The workspace
+/// HTTP URL remains the default for backwards-compatible behavior.
+fn resolve_mobile_relay_url(
+    external_relay_url: Option<&str>,
+    workspace_http_url: &str,
+) -> Result<String, String> {
+    let Some(candidate) = external_relay_url
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+    else {
+        return Ok(workspace_http_url.to_string());
+    };
+
+    let parsed = url::Url::parse(candidate)
+        .map_err(|error| format!("invalid externally reachable relay URL: {error}"))?;
+    if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
+        return Err(
+            "externally reachable relay URL must be an absolute ws:// or wss:// URL".into(),
+        );
+    }
+    if parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(
+            "externally reachable relay URL cannot contain credentials, a query string, or a fragment"
+                .into(),
+        );
+    }
+
+    // Derive the persisted URL from the parsed components, not the raw input.
+    // `Url` lowercases the scheme, so a hand-typed `WS://host` (mobile keyboard
+    // autocapitalize, copy-paste) converts correctly here — whereas the
+    // case-sensitive prefix strip in `relay::relay_http_base_url` would leave it
+    // as `WS://host` and the phone would persist an unusable protocol.
+    let mut persisted = parsed.clone();
+    let http_scheme = if parsed.scheme() == "wss" {
+        "https"
+    } else {
+        "http"
+    };
+    persisted
+        .set_scheme(http_scheme)
+        .map_err(|_| "could not convert relay URL to an http(s) URL".to_string())?;
+
+    Ok(persisted.as_str().trim_end_matches('/').to_string())
 }
 
 /// User confirmed the SAS codes match. Sends sas-confirm + payload.
@@ -728,5 +784,81 @@ mod pairing_relay_tests {
         .expect("resolve main pairing relay");
 
         assert_eq!(resolved, "wss://sprout-oss.stage.blox.sqprod.co");
+    }
+}
+
+#[cfg(test)]
+mod mobile_relay_url_tests {
+    use super::resolve_mobile_relay_url;
+
+    #[test]
+    fn missing_override_preserves_workspace_url() {
+        assert_eq!(
+            resolve_mobile_relay_url(None, "http://127.0.0.1:3000").expect("workspace fallback"),
+            "http://127.0.0.1:3000"
+        );
+    }
+
+    #[test]
+    fn external_websocket_url_becomes_mobile_http_url() {
+        assert_eq!(
+            resolve_mobile_relay_url(
+                Some("ws://brads-laptop.tail46493b.ts.net:3000"),
+                "http://127.0.0.1:3000",
+            )
+            .expect("external relay URL"),
+            "http://brads-laptop.tail46493b.ts.net:3000"
+        );
+        assert_eq!(
+            resolve_mobile_relay_url(Some("wss://relay.example.com"), "http://127.0.0.1:3000",)
+                .expect("secure external relay URL"),
+            "https://relay.example.com"
+        );
+    }
+
+    #[test]
+    fn external_override_rejects_non_websocket_and_credentialed_urls() {
+        assert!(resolve_mobile_relay_url(
+            Some("https://relay.example.com"),
+            "http://127.0.0.1:3000"
+        )
+        .is_err());
+        assert!(resolve_mobile_relay_url(
+            Some("ws://user:secret@relay.example.com"),
+            "http://127.0.0.1:3000"
+        )
+        .is_err());
+        assert!(resolve_mobile_relay_url(
+            Some("ws://relay.example.com/?token=1"),
+            "http://127.0.0.1:3000"
+        )
+        .is_err());
+        assert!(resolve_mobile_relay_url(
+            Some("ws://relay.example.com/#fragment"),
+            "http://127.0.0.1:3000"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn uppercase_scheme_still_converts_to_http() {
+        assert_eq!(
+            resolve_mobile_relay_url(
+                Some("WS://brads-laptop.tail46493b.ts.net:3000"),
+                "http://127.0.0.1:3000",
+            )
+            .expect("uppercase ws scheme"),
+            "http://brads-laptop.tail46493b.ts.net:3000"
+        );
+        assert_eq!(
+            resolve_mobile_relay_url(Some("WSS://relay.example.com"), "http://127.0.0.1:3000")
+                .expect("uppercase wss scheme"),
+            "https://relay.example.com"
+        );
+        assert_eq!(
+            resolve_mobile_relay_url(Some("Ws://relay.example.com/pair/"), "http://127.0.0.1:3000")
+                .expect("mixed-case ws scheme with path"),
+            "http://relay.example.com/pair"
+        );
     }
 }

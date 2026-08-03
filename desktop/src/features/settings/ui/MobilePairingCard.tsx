@@ -11,12 +11,14 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 
+import { useCommunities } from "@/features/communities/useCommunities";
 import {
   cancelPairing,
   confirmPairingSas,
   startPairing,
 } from "@/shared/api/tauri";
 import { Button } from "@/shared/ui/button";
+import { Input } from "@/shared/ui/input";
 import { StyledQrCode } from "@/shared/ui/styled-qr-code";
 import {
   Dialog,
@@ -174,10 +176,17 @@ export function MobilePairingCard({
 }: {
   currentPubkey?: string;
 }) {
+  const { activeCommunity, updateCommunity } = useCommunities();
   const [step, setStep] = useState<PairingStep>("idle");
   const [qrUri, setQrUri] = useState<string | null>(null);
   const [sasCode, setSasCode] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [externalRelayUrl, setExternalRelayUrl] = useState(
+    activeCommunity?.externalPairingRelayUrl ?? "",
+  );
+  const [externalRelayError, setExternalRelayError] = useState<string | null>(
+    null,
+  );
   const requestIdRef = useRef(0);
   const pairingActiveRef = useRef(false);
   const stepRef = useRef(step);
@@ -191,7 +200,7 @@ export function MobilePairingCard({
     setSasCode(null);
     setError(null);
 
-    startPairing().then(
+    startPairing(activeCommunity?.externalPairingRelayUrl).then(
       (uri) => {
         if (requestId === requestIdRef.current) {
           setQrUri(uri);
@@ -206,8 +215,15 @@ export function MobilePairingCard({
         }
       },
     );
-  }, []);
+  }, [activeCommunity?.externalPairingRelayUrl]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeCommunity?.id is an intentional reset trigger — switching between two communities that both have a blank externalPairingRelayUrl must still clear stale validation error/input state, which a value-only dependency wouldn't catch.
+  useEffect(() => {
+    setExternalRelayUrl(activeCommunity?.externalPairingRelayUrl ?? "");
+    setExternalRelayError(null);
+  }, [activeCommunity?.externalPairingRelayUrl, activeCommunity?.id]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeCommunity?.id is an intentional reset trigger — pairing state must reset on community switch even when currentPubkey is unchanged.
   useEffect(() => {
     ++requestIdRef.current;
     pairingActiveRef.current = false;
@@ -282,7 +298,44 @@ export function MobilePairingCard({
         cancelPairing().catch(() => {});
       }
     };
-  }, [currentPubkey]);
+  }, [activeCommunity?.id, currentPubkey]);
+
+  function saveExternalRelayUrl() {
+    if (!activeCommunity) return;
+    const candidate = externalRelayUrl.trim();
+    if (candidate) {
+      // Mirrors `resolve_mobile_relay_url` in src-tauri/src/commands/pairing.rs.
+      // Keep the two rule sets in step: anything accepted here but rejected
+      // there saves with a success toast and only fails later at pairing time.
+      try {
+        const parsed = new URL(candidate);
+        if (
+          (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") ||
+          !parsed.hostname ||
+          parsed.username ||
+          parsed.password ||
+          parsed.search ||
+          parsed.hash
+        ) {
+          throw new Error("invalid relay URL");
+        }
+      } catch {
+        setExternalRelayError(
+          "Enter an absolute ws:// or wss:// relay URL with no credentials, query string, or #fragment.",
+        );
+        return;
+      }
+    }
+
+    updateCommunity(activeCommunity.id, {
+      externalPairingRelayUrl: candidate,
+    });
+    setExternalRelayUrl(candidate);
+    setExternalRelayError(null);
+    toast.success(
+      candidate ? "Mobile relay URL saved" : "Using workspace relay URL",
+    );
+  }
 
   async function handleCopy() {
     if (!qrUri) return;
@@ -340,10 +393,61 @@ export function MobilePairingCard({
         }
       />
 
-      <SettingsOptionGroup
-        className="mx-auto w-fit max-w-full"
-        data-testid="mobile-pairing-card"
-      >
+      <SettingsOptionGroup data-testid="mobile-pairing-card">
+        <SettingsOptionRow className="items-start">
+          <div className="min-w-0 flex-1">
+            <label
+              className="text-sm font-medium"
+              htmlFor="external-pairing-relay-url"
+            >
+              Externally reachable relay URL
+            </label>
+            <p className="text-sm font-normal text-muted-foreground">
+              Sent only to newly paired mobile devices. Local agents keep using
+              the workspace relay URL.
+            </p>
+            <div className="mt-3 flex max-w-xl gap-2">
+              <Input
+                aria-invalid={externalRelayError ? true : undefined}
+                data-testid="external-pairing-relay-url"
+                id="external-pairing-relay-url"
+                onChange={(event) => {
+                  setExternalRelayUrl(event.target.value);
+                  setExternalRelayError(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    saveExternalRelayUrl();
+                  }
+                }}
+                placeholder={
+                  activeCommunity?.relayUrl ?? "wss://relay.example.com"
+                }
+                type="url"
+                value={externalRelayUrl}
+              />
+              <Button
+                data-testid="save-external-pairing-relay-url"
+                onClick={saveExternalRelayUrl}
+                type="button"
+                variant="outline"
+              >
+                Save
+              </Button>
+            </div>
+            {externalRelayError ? (
+              <p className="mt-1.5 text-sm text-destructive" role="alert">
+                {externalRelayError}
+              </p>
+            ) : (
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                Leave blank to use{" "}
+                {activeCommunity?.relayUrl ?? "the workspace relay URL"}.
+              </p>
+            )}
+          </div>
+        </SettingsOptionRow>
         <SettingsOptionRow className="flex-col items-stretch justify-start gap-3 p-4">
           <div
             className="flex min-h-[266px] w-[266px] shrink-0 items-center justify-center rounded-lg border border-border/70 bg-white p-3"
@@ -419,7 +523,7 @@ export function MobilePairingCard({
 
           {step === "qr" && qrUri ? (
             <Button
-              className="w-full origin-top animate-in fade-in-0 zoom-in-95 duration-[250ms] ease-[cubic-bezier(0.23,1,0.32,1)] motion-reduce:animate-none"
+              className="w-[266px] max-w-full origin-top animate-in fade-in-0 zoom-in-95 duration-[250ms] ease-[cubic-bezier(0.23,1,0.32,1)] motion-reduce:animate-none"
               data-testid="copy-pairing-code"
               onClick={handleCopy}
               size="sm"

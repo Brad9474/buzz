@@ -98,6 +98,13 @@ test("resolveCommunityUpdateResult_pubkey_change_does_not_require_reinit", () =>
   assert.deepEqual(result, { kind: "updated", requiresReinit: false });
 });
 
+test("resolveCommunityUpdateResult_external_pairing_relay_does_not_reinit_agents", () => {
+  const result = resolveCommunityUpdateResult(COMMUNITIES, "ws-1", "ws-1", {
+    externalPairingRelayUrl: "ws://laptop.tailnet.example:3000",
+  });
+  assert.deepEqual(result, { kind: "updated", requiresReinit: false });
+});
+
 test("resolveCommunityUpdateResult_same_relay_url_is_not_duplicate_of_self", () => {
   // Setting the same relay URL that ws-1 already has is unchanged, not duplicate.
   const result = resolveCommunityUpdateResult(COMMUNITIES, "ws-1", "ws-1", {

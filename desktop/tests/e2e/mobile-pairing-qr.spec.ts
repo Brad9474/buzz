@@ -51,6 +51,18 @@ test("mobile pairing starts on demand and reveals the QR code", async ({
   const startButton = card.getByTestId("start-pairing-button");
   await expect(card).toBeVisible();
   await expect(startButton).toHaveText("Start pairing");
+  const externalRelayInput = card.getByTestId("external-pairing-relay-url");
+  await expect(externalRelayInput).toHaveValue("");
+
+  // The Rust side rejects fragments, so save-time validation must too —
+  // otherwise this saves with a success toast and only fails at pairing time.
+  await externalRelayInput.fill("ws://laptop.tailnet.example:3000/#frag");
+  await card.getByTestId("save-external-pairing-relay-url").click();
+  await expect(card.getByRole("alert")).toBeVisible();
+
+  await externalRelayInput.fill("ws://laptop.tailnet.example:3000");
+  await card.getByTestId("save-external-pairing-relay-url").click();
+  await expect(card.getByRole("alert")).toHaveCount(0);
   await expect(page.getByTestId("mobile-pairing-qr")).toHaveCount(0);
   await expect(page.getByTestId("copy-pairing-code")).toHaveCount(0);
   expect(
@@ -81,6 +93,15 @@ test("mobile pairing starts on demand and reveals the QR code", async ({
   const qrCode = page.getByTestId("mobile-pairing-qr");
   const copyButton = card.getByTestId("copy-pairing-code");
   await expect(qrCode).toBeVisible();
+  expect(
+    await page.evaluate(() => {
+      const invocation = (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).find(
+        (entry) => entry.command === "start_pairing",
+      );
+      return (invocation?.payload as { externalRelayUrl?: string } | undefined)
+        ?.externalRelayUrl;
+    }),
+  ).toBe("ws://laptop.tailnet.example:3000");
   await expect(copyButton).toHaveText("Copy pairing code");
   await expect(startButton).toHaveCount(0);
   await expect(card.getByText("Pair mobile device")).toHaveCount(0);
