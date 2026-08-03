@@ -1157,8 +1157,10 @@ export async function nip44DecryptFromSelf(
 
 // ── NIP-AB device pairing ───────────────────────────────────────────────────
 
-export async function startPairing(): Promise<string> {
-  return invokeTauri<string>("start_pairing");
+export async function startPairing(externalRelayUrl?: string): Promise<string> {
+  return invokeTauri<string>("start_pairing", {
+    externalRelayUrl: externalRelayUrl ?? null,
+  });
 }
 
 export async function confirmPairingSas(): Promise<void> {

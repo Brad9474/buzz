@@ -2,6 +2,12 @@ export type Community = {
   id: string;
   name: string;
   relayUrl: string;
+  /**
+   * Optional relay URL handed to newly paired mobile devices. This is kept
+   * separate from `relayUrl` so a LAN/loopback agent relay can advertise an
+   * externally reachable address without retargeting local agents.
+   */
+  externalPairingRelayUrl?: string;
   token?: string;
   /**
    * The pubkey associated with the active identity at the time the community
