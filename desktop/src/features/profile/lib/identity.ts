@@ -123,8 +123,18 @@ export function resolveUserLabel(input: {
     return nip05Handle;
   }
 
+  // A pubkey is not a name. `ChannelInfo.participants` is built as a verbatim
+  // clone of `participant_pubkeys` (see `channel_from_event` in
+  // nostr_convert.rs), so for DM channels the "fallback name" handed to this
+  // function is routinely the participant's own pubkey. Returning it renders
+  // a raw 64-character hex string where a display name belongs, and it makes
+  // the truncation below unreachable — the compact `abcd1234…wxyz` form only
+  // ever appears when there is no fallback at all. Fall through instead.
   const safeFallback = fallbackName?.trim();
-  if (safeFallback) {
+  if (
+    safeFallback &&
+    normalizePubkey(safeFallback) !== normalizePubkey(pubkey)
+  ) {
     return safeFallback;
   }
 

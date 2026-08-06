@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatOwnerLabel, profileLookupsEqual } from "./identity.ts";
+import {
+  formatOwnerLabel,
+  profileLookupsEqual,
+  resolveUserLabel,
+} from "./identity.ts";
 
 const OWNER_PUBKEY =
   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -119,4 +123,69 @@ test("stabiliser: a real profile change swaps the reference (re-render fires)", 
   // ...and then re-stabilises around the new value.
   const held = stabilise({ p1: summary({ displayName: "Grace" }) });
   assert.equal(held, changed, "must re-stabilise around the new value");
+});
+
+// ── resolveUserLabel: a pubkey is never a name ──────────────────────────────
+//
+// `ChannelInfo.participants` is a verbatim clone of `participant_pubkeys`
+// (nostr_convert.rs), so DM surfaces hand this function the participant's own
+// pubkey as `fallbackName`. Without a guard that renders a raw 64-character
+// hex string in the sidebar where a display name belongs.
+
+const DM_PUBKEY =
+  "18073dfee86227e4954adc9e93850c371e0731a25266050ef2ef00200e9d85bf";
+const TRUNCATED = "18073dfe…85bf";
+
+test("resolveUserLabel: a fallback that is the pubkey falls through to truncation", () => {
+  assert.equal(
+    resolveUserLabel({ pubkey: DM_PUBKEY, fallbackName: DM_PUBKEY }),
+    TRUNCATED,
+    "the raw pubkey must not be returned as if it were a display name",
+  );
+});
+
+test("resolveUserLabel: pubkey fallback is rejected regardless of case or padding", () => {
+  for (const variant of [
+    DM_PUBKEY.toUpperCase(),
+    `  ${DM_PUBKEY}  `,
+    `\t${DM_PUBKEY.toUpperCase()}\n`,
+  ]) {
+    assert.equal(
+      resolveUserLabel({ pubkey: DM_PUBKEY, fallbackName: variant }),
+      TRUNCATED,
+      `hex is case-insensitive and tags carry stray whitespace: ${JSON.stringify(variant)}`,
+    );
+  }
+});
+
+test("resolveUserLabel: a genuine fallback name is still used", () => {
+  assert.equal(
+    resolveUserLabel({ pubkey: DM_PUBKEY, fallbackName: "Helm" }),
+    "Helm",
+  );
+});
+
+test("resolveUserLabel: a different pubkey as fallback is left alone", () => {
+  // Only the participant's *own* pubkey is rejected. Anything else is data
+  // this function has no business second-guessing.
+  assert.equal(
+    resolveUserLabel({ pubkey: DM_PUBKEY, fallbackName: OWNER_PUBKEY }),
+    OWNER_PUBKEY,
+  );
+});
+
+test("resolveUserLabel: a resolved profile still outranks both", () => {
+  assert.equal(
+    resolveUserLabel({
+      pubkey: DM_PUBKEY,
+      fallbackName: DM_PUBKEY,
+      profiles: { [DM_PUBKEY]: summary({ displayName: "Helm" }) },
+    }),
+    "Helm",
+    "the guard must not shadow a real display name",
+  );
+});
+
+test("resolveUserLabel: with no fallback at all, behaviour is unchanged", () => {
+  assert.equal(resolveUserLabel({ pubkey: DM_PUBKEY }), TRUNCATED);
 });
