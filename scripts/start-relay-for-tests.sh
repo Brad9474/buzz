@@ -155,6 +155,9 @@ nohup env \
   DATABASE_URL=postgres://buzz:buzz_dev@localhost:5432/buzz \
   REDIS_URL=redis://localhost:6379 \
   RELAY_URL=ws://localhost:3000 \
+  BUZZ_S3_ENDPOINT=http://localhost:9000 \
+  BUZZ_S3_ACCESS_KEY=buzz_dev \
+  BUZZ_S3_SECRET_KEY=buzz_dev_secret \
   BUZZ_BIND_ADDR=0.0.0.0:3000 \
   BUZZ_REQUIRE_AUTH_TOKEN=false \
   BUZZ_RECONCILE_CHANNELS=true \

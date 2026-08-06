@@ -397,6 +397,68 @@ fn parse_optional_bool(name: &str) -> Result<bool, ConfigError> {
     parse_bool(name, false)
 }
 
+/// Whether the built-in development credentials may stand in for unset
+/// settings.
+///
+/// True only under `cfg!(test)`, where the unit tests build a `Config` from a
+/// bare environment. There is deliberately **no runtime opt-in**: an
+/// environment variable that re-enabled the defaults would reinstate the exact
+/// failure this refusal exists to prevent, and it would do so on the one
+/// machine where somebody was already confused enough to go looking for an
+/// escape hatch. A relay that cannot find its credentials should stop, not
+/// quietly point itself at a development database.
+fn dev_defaults_allowed() -> bool {
+    cfg!(test)
+}
+
+/// Reads a credential-bearing setting, using `dev_default` only where
+/// [`dev_defaults_allowed`] permits it.
+///
+/// Silently defaulting these is how a relay started without its environment
+/// ends up talking to whatever happens to be answering on the default port
+/// with the default credentials, rather than refusing to start. An empty
+/// value counts as unset: `EnvironmentFile=` turns a blank line into one.
+fn credential_from_env(name: &str, dev_default: &str) -> Result<String, ConfigError> {
+    resolve_credential(
+        name,
+        std::env::var(name).ok(),
+        dev_defaults_allowed(),
+        dev_default,
+    )
+}
+
+/// The decision behind [`credential_from_env`], split out so the refusal
+/// branch is reachable from tests — `dev_defaults_allowed()` is always true
+/// under `cfg!(test)`, so calling the env-reading wrapper could never
+/// exercise it.
+fn resolve_credential(
+    name: &str,
+    value: Option<String>,
+    dev_allowed: bool,
+    dev_default: &str,
+) -> Result<String, ConfigError> {
+    match value {
+        Some(value) if !value.trim().is_empty() => Ok(value),
+        _ if dev_allowed => {
+            // Only reachable from a test build. Say so loudly anyway: if this
+            // ever appears in a real relay's log, the build or the gate above
+            // is wrong, and the relay is running on a credential nobody chose.
+            warn!(
+                setting = %name,
+                "falling back to the built-in development default — this must never happen \
+                 outside a test build"
+            );
+            Ok(dev_default.to_string())
+        }
+        _ => Err(ConfigError::InvalidValue(format!(
+            "{name} is not set; refusing to start rather than fall back to the built-in \
+             development default. The relay does not read .env itself — systemd loads it \
+             via EnvironmentFile= and `just relay` sources it — so check how this process \
+             was launched."
+        ))),
+    }
+}
+
 fn ensure_git_repo_path(
     raw: impl Into<std::path::PathBuf>,
 ) -> Result<std::path::PathBuf, ConfigError> {
@@ -424,8 +486,10 @@ impl Config {
             std::env::var("BUZZ_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
         let bind_addr = parse_bind_addr(&bind_addr_raw)?;
 
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
+        let database_url = credential_from_env(
+            "DATABASE_URL",
+            "postgres://buzz:buzz_dev@localhost:5432/buzz", // sadscan:disable np.postgres.1
+        )?;
 
         let read_database_url = std::env::var("READ_DATABASE_URL")
             .ok()
@@ -676,12 +740,9 @@ impl Config {
             }
         };
         let media = buzz_media::MediaConfig {
-            s3_endpoint: std::env::var("BUZZ_S3_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:9000".to_string()),
-            s3_access_key: std::env::var("BUZZ_S3_ACCESS_KEY")
-                .unwrap_or_else(|_| "buzz_dev".to_string()),
-            s3_secret_key: std::env::var("BUZZ_S3_SECRET_KEY")
-                .unwrap_or_else(|_| "buzz_dev_secret".to_string()),
+            s3_endpoint: credential_from_env("BUZZ_S3_ENDPOINT", "http://localhost:9000")?,
+            s3_access_key: credential_from_env("BUZZ_S3_ACCESS_KEY", "buzz_dev")?,
+            s3_secret_key: credential_from_env("BUZZ_S3_SECRET_KEY", "buzz_dev_secret")?,
             s3_bucket: std::env::var("BUZZ_S3_BUCKET").unwrap_or_else(|_| "buzz-media".to_string()),
             s3_region: std::env::var("BUZZ_S3_REGION")
                 .or_else(|_| std::env::var("AWS_REGION"))
@@ -996,6 +1057,48 @@ mod tests {
     // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
     // value set by `invalid_bind_addr_returns_error`, causing a flaky failure.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn unset_credential_refuses_to_start_outside_dev() {
+        let error = resolve_credential("DATABASE_URL", None, false, "postgres://dev")
+            .expect_err("unset credential must not fall back outside a dev profile");
+        let message = error.to_string();
+        assert!(message.contains("DATABASE_URL"), "{message}");
+        assert!(message.contains("refusing to start"), "{message}");
+        assert!(
+            !message.contains("postgres://dev"),
+            "the refusal must not leak the default credential: {message}"
+        );
+    }
+
+    #[test]
+    fn blank_credential_is_treated_as_unset() {
+        assert!(
+            resolve_credential("BUZZ_S3_SECRET_KEY", Some("   ".to_string()), false, "s").is_err()
+        );
+        assert_eq!(
+            resolve_credential("BUZZ_S3_SECRET_KEY", Some(String::new()), true, "s").unwrap(),
+            "s"
+        );
+    }
+
+    #[test]
+    fn credential_prefers_the_environment_over_the_dev_default() {
+        assert_eq!(
+            resolve_credential(
+                "DATABASE_URL",
+                Some("postgres://real".into()),
+                true,
+                "postgres://dev"
+            )
+            .unwrap(),
+            "postgres://real"
+        );
+        assert_eq!(
+            resolve_credential("DATABASE_URL", None, true, "postgres://dev").unwrap(),
+            "postgres://dev"
+        );
+    }
 
     #[test]
     fn defaults_are_valid() {
