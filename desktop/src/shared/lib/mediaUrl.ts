@@ -190,7 +190,9 @@ async function fetchProxyPort(): Promise<number | null> {
           deadline,
         );
         if (hosts !== null && generation === cacheGeneration) {
-          cachedCommunityHosts = new Set(hosts.map((host) => host.toLowerCase()));
+          cachedCommunityHosts = new Set(
+            hosts.map((host) => host.toLowerCase()),
+          );
         }
       } catch {
         // Older relays do not advertise aliases; origin matching remains the fallback.
