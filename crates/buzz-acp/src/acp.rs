@@ -804,7 +804,11 @@ impl AcpClient {
                 self.current_hard_deadline = None;
             }
         }
-        self.parse_stop_reason(&result?)
+        let settled = result?;
+        // Claude-path token capture. Must happen before `parse_stop_reason`
+        // narrows the response to its `stopReason`, which discards the rest.
+        self.record_prompt_response_usage(session_id, &settled);
+        self.parse_stop_reason(&settled)
     }
 
     /// Send a `session/cancel` **notification** (no `id` field, no response expected).
@@ -1021,6 +1025,11 @@ impl AcpClient {
                 remaining,
             )
             .await?;
+        // A cancelled turn still burned real tokens, and the adapter reports
+        // them on the drained response. Skipping this site would silently
+        // under-report exactly the turns most worth watching — the ones that
+        // ran long enough to hit a timeout.
+        self.record_prompt_response_usage(session_id, &result);
         self.parse_stop_reason(&result)
     }
 
@@ -1800,10 +1809,88 @@ impl AcpClient {
                 }
                 false
             }
+            "usage_update" => {
+                // The Claude ACP adapter reports cost here, as the cumulative
+                // session total (ACP `UsageUpdate.cost`: "Cumulative session
+                // cost"). Tokens do NOT arrive here — `used` is context
+                // occupancy — they come on the `session/prompt` response.
+                //
+                // goose sends its own usage on `_goose/unstable/session/update`
+                // instead; see `handle_goose_usage_update`. Should a goose
+                // build ever also emit on this channel, this arm is inert for
+                // it: stashing a cost never creates a publishable record.
+                self.handle_acp_usage_update(msg);
+                false
+            }
             "keepalive" => false,
             other => {
                 tracing::debug!(target: "acp::update", "session/update: {other}");
                 false
+            }
+        }
+    }
+
+    /// Record the cumulative session cost from a standard `session/update`
+    /// notification with `sessionUpdate: "usage_update"`.
+    ///
+    /// Best-effort observability, like its goose counterpart: a missing or
+    /// malformed field is logged at debug and dropped, never surfaced as an
+    /// error. A turn must never fail because its metric could not be read.
+    fn handle_acp_usage_update(&mut self, msg: &serde_json::Value) {
+        let Some(session_id) = msg["params"]["sessionId"].as_str() else {
+            tracing::debug!(
+                target: "acp::usage",
+                "session/update usage_update: missing sessionId"
+            );
+            return;
+        };
+        let update = &msg["params"]["update"];
+        let Some(cost) = update["cost"]["amount"].as_f64() else {
+            // `cost` is optional in the ACP schema; its absence is normal, not
+            // a fault. Nothing else in this notification is worth recording.
+            return;
+        };
+        tracing::debug!(
+            target: "acp::usage",
+            session_id = %session_id,
+            cumulative_cost_usd = cost,
+            context_used = update["used"].as_u64().unwrap_or(0),
+            context_size = update["size"].as_u64().unwrap_or(0),
+            "acp usage update"
+        );
+        self.goose_usage.record_claude_cost(session_id, cost);
+    }
+
+    /// Record per-turn token counts from a `session/prompt` response.
+    ///
+    /// The Claude ACP adapter attaches a `usage` object to every settled
+    /// prompt response, already scoped to the turn. Agents that attach nothing
+    /// (goose among them) return at the first guard, leaving them to report
+    /// through their own notification channel.
+    fn record_prompt_response_usage(&mut self, session_id: &str, result: &serde_json::Value) {
+        let Some(usage) = result.get("usage") else {
+            return;
+        };
+        match serde_json::from_value::<crate::usage::PromptResponseUsage>(usage.clone()) {
+            Ok(parsed) => {
+                tracing::debug!(
+                    target: "acp::usage",
+                    session_id = %session_id,
+                    input = parsed.input_tokens,
+                    output = parsed.output_tokens,
+                    cache_read = parsed.cached_read_tokens,
+                    cache_write = parsed.cached_write_tokens,
+                    "prompt response usage"
+                );
+                self.goose_usage.record_claude_turn(session_id, &parsed);
+            }
+            Err(e) => {
+                // Publish nothing rather than a zeroed record: a turn missing
+                // from the ledger is honest, a turn recorded as free is not.
+                tracing::debug!(
+                    target: "acp::usage",
+                    "session/prompt response usage: deserialization error: {e}"
+                );
             }
         }
     }
@@ -4229,6 +4316,118 @@ mod tests {
             "params": { "oops": true }
         });
         client.handle_goose_usage_update(&bad2);
+        assert!(client.take_turn_usage().is_none());
+    }
+
+    // ── Claude adapter usage capture ───────────────────────────────────────
+
+    /// A standard `session/update` notification as the Claude ACP adapter
+    /// emits it (`dist/acp-agent.js:2228`).
+    fn acp_usage_update_msg(session_id: &str, cost: Option<f64>) -> serde_json::Value {
+        let mut update = serde_json::json!({
+            "sessionUpdate": "usage_update",
+            "used": 51_234,
+            "size": 200_000,
+        });
+        if let Some(c) = cost {
+            update["cost"] = serde_json::json!({ "amount": c, "currency": "USD" });
+        }
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": { "sessionId": session_id, "update": update }
+        })
+    }
+
+    /// A settled `session/prompt` response as the adapter returns it.
+    fn prompt_response(input: u64, output: u64, read: u64, write: u64) -> serde_json::Value {
+        serde_json::json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": input,
+                "outputTokens": output,
+                "cachedReadTokens": read,
+                "cachedWriteTokens": write,
+                "totalTokens": input + output + read + write,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn claude_usage_update_and_prompt_response_produce_a_metric() {
+        let mut client = spawn_inert_client().await;
+        client.goose_usage.begin_turn("c1");
+
+        // Cost arrives mid-turn on the notification channel; tokens arrive on
+        // the response. Both must land in one record.
+        assert!(
+            !client.handle_session_update(&acp_usage_update_msg("c1", Some(0.037))),
+            "a usage_update must not be mistaken for tool-call activity"
+        );
+        client.record_prompt_response_usage("c1", &prompt_response(200, 60, 5_000, 300));
+
+        let usage = client.take_turn_usage().expect("metric for the turn");
+        assert_eq!(usage.session_id, "c1");
+        assert_eq!(usage.turn_seq, 1);
+        assert!(usage.delta_reliable);
+        assert_eq!(
+            usage.turn_input_tokens,
+            Some(5_500),
+            "cache-inclusive input"
+        );
+        assert_eq!(usage.turn_output_tokens, Some(60));
+        assert_eq!(usage.turn_cache_read_tokens, Some(5_000));
+        assert_eq!(usage.turn_cache_write_tokens, Some(300));
+        let cost = usage.turn_cost_usd.expect("cost");
+        assert!((cost - 0.037).abs() < 1e-9, "cost: {cost}");
+    }
+
+    #[tokio::test]
+    async fn a_response_without_usage_produces_no_metric() {
+        // goose-shaped: `stopReason` only. The Claude path must stay dormant so
+        // goose keeps reporting through its own notification channel alone.
+        let mut client = spawn_inert_client().await;
+        client.goose_usage.begin_turn("g1");
+        client.record_prompt_response_usage("g1", &serde_json::json!({"stopReason": "end_turn"}));
+        assert!(client.take_turn_usage().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_response_usage_object_produces_no_metric() {
+        let mut client = spawn_inert_client().await;
+        client.goose_usage.begin_turn("c1");
+        client.record_prompt_response_usage(
+            "c1",
+            &serde_json::json!({"stopReason": "end_turn", "usage": {"cachedReadTokens": 5}}),
+        );
+        assert!(
+            client.take_turn_usage().is_none(),
+            "a turn missing from the ledger beats a turn recorded as free"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_usage_update_without_cost_is_ignored_without_panic() {
+        let mut client = spawn_inert_client().await;
+        client.goose_usage.begin_turn("c1");
+        client.handle_session_update(&acp_usage_update_msg("c1", None));
+        client.record_prompt_response_usage("c1", &prompt_response(100, 20, 0, 0));
+
+        let usage = client.take_turn_usage().expect("metric");
+        assert_eq!(usage.turn_input_tokens, Some(100));
+        assert!(usage.turn_cost_usd.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_usage_update_without_session_id_is_dropped() {
+        let mut client = spawn_inert_client().await;
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": { "update": { "sessionUpdate": "usage_update",
+                                    "cost": { "amount": 1.0, "currency": "USD" } } }
+        });
+        client.handle_session_update(&msg);
         assert!(client.take_turn_usage().is_none());
     }
 
