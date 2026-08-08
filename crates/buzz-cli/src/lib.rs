@@ -203,6 +203,9 @@ enum Cmd {
     /// Read the activity feed
     #[command(subcommand)]
     Feed(FeedCmd),
+    /// Roll up per-agent token and cost usage (owner-only)
+    #[command(subcommand)]
+    Usage(UsageCmd),
     /// Publish notes and manage the social graph (NIP-01/02)
     #[command(subcommand)]
     Social(SocialCmd),
@@ -948,6 +951,35 @@ pub enum FeedCmd {
         /// Comma-separated feed types to include: mentions, needs_action, activity, agent_activity
         #[arg(long)]
         types: Option<String>,
+    },
+}
+
+/// Per-agent token/cost rollup from NIP-AM kind 44200 metrics.
+///
+/// These events are encrypted to their owner and result-gated by the relay, so
+/// both subcommands only ever surface usage belonging to the key running them.
+#[derive(Subcommand)]
+pub enum UsageCmd {
+    /// Print a per-agent usage rollup.
+    ///
+    /// Emits JSON rows by default, matching every other read command. Pass the
+    /// global `--format compact` (before the subcommand) for the Markdown table
+    /// that `usage digest` posts.
+    Summary {
+        /// Unix timestamp — only include turns recorded after this time.
+        /// Omit for all-time totals.
+        #[arg(long)]
+        since: Option<i64>,
+    },
+    /// Post a per-agent usage rollup into a channel
+    Digest {
+        /// Channel UUID to post the rollup into
+        #[arg(long)]
+        channel: String,
+        /// Unix timestamp — only include turns recorded after this time.
+        /// Omit for all-time totals.
+        #[arg(long)]
+        since: Option<i64>,
     },
 }
 
@@ -1813,6 +1845,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Users(sub) => commands::users::dispatch(sub, &client, &cli.format).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
         Cmd::Feed(sub) => commands::feed::dispatch(sub, &client, &cli.format).await,
+        Cmd::Usage(sub) => commands::usage::dispatch(sub, &client, &cli.format).await,
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
         Cmd::Notes(sub) => commands::notes::dispatch(sub, &client).await,
         Cmd::Repos(sub) => commands::repos::dispatch(sub, &client).await,
@@ -1884,6 +1917,7 @@ mod tests {
             "repos",
             "social",
             "upload",
+            "usage",
             "users",
             "workflows",
         ];
@@ -1996,6 +2030,7 @@ mod tests {
             vec!["approve", "create", "delete", "get", "list", "runs", "trigger", "update"]
         );
         assert_eq!(names(&cmd, "feed"), vec!["get"]);
+        assert_eq!(names(&cmd, "usage"), vec!["digest", "summary"]);
         assert_eq!(
             names(&cmd, "social"),
             vec![
