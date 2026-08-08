@@ -3439,8 +3439,12 @@ pub(crate) fn build_turn_metric_counts(
             // from input+output.
             total_tokens: usage.turn_total_tokens,
             cost_usd: usage.turn_cost_usd,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
+            // Informational subsets of `input_tokens`. Present on the Claude
+            // path, `None` on the goose path, which reports no read/write
+            // split. Cache reads bill at a fraction of fresh input, so a cost
+            // view without them misreads a heavily-cached turn as expensive.
+            cache_read_tokens: usage.turn_cache_read_tokens,
+            cache_write_tokens: usage.turn_cache_write_tokens,
         })
     } else {
         // Defense-in-depth: UsageTracker already sets all turn_* fields to None
@@ -3457,8 +3461,8 @@ pub(crate) fn build_turn_metric_counts(
         // one. Never derived from input+output (NIP-AM MUST NOT).
         total_tokens: usage.cumulative_total_tokens,
         cost_usd: usage.cumulative_cost_usd,
-        cache_read_tokens: None,
-        cache_write_tokens: None,
+        cache_read_tokens: usage.cumulative_cache_read_tokens,
+        cache_write_tokens: usage.cumulative_cache_write_tokens,
     });
     (turn_counts, cumulative_counts)
 }
@@ -5275,6 +5279,10 @@ mod tests {
             cumulative_output_tokens: 50,
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            turn_cache_read_tokens: None,
+            turn_cache_write_tokens: None,
+            cumulative_cache_read_tokens: None,
+            cumulative_cache_write_tokens: None,
             model: None,
         };
         // owner_pubkey = None → early return, no panic.
@@ -5309,6 +5317,10 @@ mod tests {
             cumulative_output_tokens: 80,
             cumulative_total_tokens: None,
             cumulative_cost_usd: Some(0.001),
+            turn_cache_read_tokens: None,
+            turn_cache_write_tokens: None,
+            cumulative_cache_read_tokens: None,
+            cumulative_cache_write_tokens: None,
             model: None,
         };
         // Will try to publish and fail (no real relay) but must not panic.
@@ -5344,6 +5356,10 @@ mod tests {
             cumulative_output_tokens: 70,
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            turn_cache_read_tokens: None,
+            turn_cache_write_tokens: None,
+            cumulative_cache_read_tokens: None,
+            cumulative_cache_write_tokens: None,
             model: None,
         };
         // Must not panic; HTTP submit will fail (no real relay) — that's fine.
@@ -5379,6 +5395,10 @@ mod tests {
             cumulative_output_tokens: 100,
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            turn_cache_read_tokens: None,
+            turn_cache_write_tokens: None,
+            cumulative_cache_read_tokens: None,
+            cumulative_cache_write_tokens: None,
             model: None,
         };
         // Will try to publish (encrypt succeeds) and fail HTTP (no relay) — must not panic.
@@ -5411,6 +5431,10 @@ mod tests {
             cumulative_output_tokens: 120,
             cumulative_total_tokens: Some(620), // genuine cumulative total
             cumulative_cost_usd: None,
+            turn_cache_read_tokens: None,
+            turn_cache_write_tokens: None,
+            cumulative_cache_read_tokens: None,
+            cumulative_cache_write_tokens: None,
             model: None,
         };
 
@@ -5458,6 +5482,10 @@ mod tests {
             cumulative_output_tokens: 60,
             cumulative_total_tokens: None, // session has no total
             cumulative_cost_usd: None,
+            turn_cache_read_tokens: None,
+            turn_cache_write_tokens: None,
+            cumulative_cache_read_tokens: None,
+            cumulative_cache_write_tokens: None,
             model: None,
         };
 

@@ -30,6 +30,31 @@
 //!
 //! The `TurnUsage` produced after each turn is consumed by the
 //! `TurnCompletionGuard` in `pool.rs` to publish a kind 44200 relay event.
+//!
+//! # The Claude adapter path
+//!
+//! `@agentclientprotocol/claude-agent-acp` reports usage differently, on two
+//! separate channels, and neither matches the goose wire format above:
+//!
+//! 1. **Tokens** arrive on the `session/prompt` *response* as a `usage` object
+//!    (`inputTokens`, `outputTokens`, `cachedReadTokens`, `cachedWriteTokens`).
+//!    These are already **per-turn absolutes** — the adapter zeroes its
+//!    accumulator on every turn activation — so no delta arithmetic applies.
+//! 2. **Cost** arrives on a standard `session/update` notification with
+//!    `sessionUpdate: "usage_update"`, as `cost.amount`. Per the ACP schema
+//!    this is the **cumulative session cost**, so it *does* need
+//!    `current − previous` delta arithmetic.
+//!
+//! The notification's `used` field is context occupancy, not a cumulative token
+//! count, so it is unusable for accounting and is ignored here.
+//!
+//! Claude state lives in [`UsageTracker::claude_sessions`], entirely separate
+//! from the goose [`SessionState`] map, so the two paths cannot perturb each
+//! other. Crucially, a `usage_update` notification only ever *stashes* a cost;
+//! it never creates a publishable record. Records on this path are created
+//! solely by [`UsageTracker::record_claude_turn`], which the caller invokes only
+//! when a `session/prompt` response actually carried a `usage` object — which
+//! goose responses never do.
 
 use std::collections::HashMap;
 
@@ -106,6 +131,85 @@ pub(crate) struct UsageUpdatePayload {
     pub model: Option<String>,
 }
 
+/// Per-turn token counts from a Claude ACP `session/prompt` response `usage`
+/// object.
+///
+/// Wire shape (camelCase), produced by the adapter's `sessionUsage()`:
+/// ```json
+/// {
+///   "inputTokens": 1234,
+///   "outputTokens": 567,
+///   "cachedReadTokens": 8901,
+///   "cachedWriteTokens": 234,
+///   "totalTokens": 10936
+/// }
+/// ```
+///
+/// `totalTokens` is deliberately not deserialized: the adapter derives it by
+/// summing the other four, and NIP-AM forbids a derived total (see
+/// `TokenCounts::total_tokens`). Reporting it would fabricate a
+/// provider-attributed number.
+///
+/// `inputTokens` / `outputTokens` are **required**. If the adapter ever changes
+/// shape, deserialization fails and the turn simply publishes no metric — a
+/// missing datapoint, rather than a silent zero that reads as "this turn was
+/// free".
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PromptResponseUsage {
+    /// Anthropic's `input_tokens` — **excludes** cache reads and writes.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Optional: absent on adapter builds that predate cache reporting.
+    #[serde(default)]
+    pub cached_read_tokens: u64,
+    #[serde(default)]
+    pub cached_write_tokens: u64,
+}
+
+/// Which code path produced the current `pending` record.
+///
+/// `take()` needs this because the two paths keep their baselines in different
+/// maps: advancing goose's `SessionState` for a Claude record would seed a
+/// phantom entry that goose's own delta arithmetic would later measure from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingSource {
+    Goose,
+    Claude,
+}
+
+/// Per-session state for the Claude adapter path.
+///
+/// Held separately from [`SessionState`] so that neither path can corrupt the
+/// other's baseline.
+#[derive(Debug, Clone, Default)]
+struct ClaudeSessionState {
+    /// Per-session turn counter for the LAST PUBLISHED metric (1-based).
+    published_seq: u64,
+    /// Running sums of the per-turn absolutes, in the NIP-AM sense
+    /// (`cum_input` is cache-inclusive). Advanced in `record_claude_turn`, not
+    /// in `take()`: each turn's absolutes must be added exactly once, whether
+    /// or not the resulting record is ever published.
+    cum_input: u64,
+    cum_output: u64,
+    cum_cache_read: u64,
+    cum_cache_write: u64,
+    /// Cumulative session cost at the end of the LAST PUBLISHED turn.
+    ///
+    /// Starts at 0.0, which is exact rather than merely convenient: buzz-acp
+    /// has no `session/load` path — every session is created fresh via
+    /// `session_new_full` — so a session's cumulative cost genuinely begins at
+    /// zero and turn 1's delta is the full amount.
+    ///
+    /// Advanced in `take()`, not on record, so that a turn whose record is
+    /// dropped rolls its cost into the next published turn instead of losing
+    /// it. The sum of published turn costs therefore tracks the session total.
+    last_cost: f64,
+    /// Latest cumulative cost seen from a `usage_update` notification.
+    /// `None` until the adapter reports one.
+    latest_cost: Option<f64>,
+}
+
 /// Per-session normalization state: the last cumulative snapshot we saw.
 #[derive(Debug, Clone)]
 struct SessionState {
@@ -160,6 +264,17 @@ pub struct TurnUsage {
     pub cumulative_total_tokens: Option<u64>,
     /// Session-cumulative estimated cost in USD; `None` if goose did not report it.
     pub cumulative_cost_usd: Option<f64>,
+    /// Per-turn cache-read tokens (a subset of `turn_input_tokens`).
+    /// `None` on the goose path, which reports only a cumulative cache figure.
+    pub turn_cache_read_tokens: Option<u64>,
+    /// Per-turn cache-write tokens (a subset of `turn_input_tokens`).
+    pub turn_cache_write_tokens: Option<u64>,
+    /// Session-cumulative cache-read tokens (a subset of
+    /// `cumulative_input_tokens`). `None` on the goose path.
+    pub cumulative_cache_read_tokens: Option<u64>,
+    /// Session-cumulative cache-write tokens (a subset of
+    /// `cumulative_input_tokens`). `None` on the goose path.
+    pub cumulative_cache_write_tokens: Option<u64>,
     /// Effective model id for this turn (maps to NIP-AM `model`). `None` if the
     /// harness did not include the model in its usage notification.
     pub model: Option<String>,
@@ -190,12 +305,17 @@ pub struct TurnUsage {
 pub(crate) struct UsageTracker {
     /// One entry per goose `sessionId` ever seen in this process.
     sessions: HashMap<String, SessionState>,
+    /// One entry per Claude-adapter `sessionId` ever seen in this process.
+    /// Disjoint from `sessions` in practice: an agent speaks one dialect.
+    claude_sessions: HashMap<String, ClaudeSessionState>,
     /// The session that currently has an in-flight `session/prompt`.
     /// `None` means no prompt is in flight; `record()` will still update
     /// the baseline but will not set `pending`.
     in_flight_session: Option<String>,
     /// The most recently computed turn usage, ready for `take()`.
     pending: Option<TurnUsage>,
+    /// Which path produced `pending`. Always `Some` when `pending` is `Some`.
+    pending_source: Option<PendingSource>,
 }
 
 impl UsageTracker {
@@ -208,6 +328,7 @@ impl UsageTracker {
     pub(crate) fn begin_turn(&mut self, session_id: &str) {
         self.in_flight_session = Some(session_id.to_string());
         self.pending = None;
+        self.pending_source = None;
     }
 
     /// Process a `usage_update` notification payload.
@@ -309,8 +430,17 @@ impl UsageTracker {
                 cumulative_output_tokens: current_output,
                 cumulative_total_tokens: current_total,
                 cumulative_cost_usd: current_cost,
+                // goose reports only a cumulative cache figure and no
+                // write/read split, so there is nothing faithful to publish
+                // per turn here. Wiring the cumulative figure through would
+                // need its own delta baseline; out of scope for this path.
+                turn_cache_read_tokens: None,
+                turn_cache_write_tokens: None,
+                cumulative_cache_read_tokens: None,
+                cumulative_cache_write_tokens: None,
                 model: payload.model.clone(),
             });
+            self.pending_source = Some(PendingSource::Goose);
         } else if self.in_flight_session.is_none() {
             // Not in-flight at all: advance the committed baseline so the next
             // in-flight turn computes its delta from this notification.
@@ -335,6 +465,104 @@ impl UsageTracker {
         // committed baseline; doing so would undercount X's next published delta.
     }
 
+    /// Stash the session-cumulative cost from a Claude `usage_update`
+    /// notification on the standard `session/update` channel.
+    ///
+    /// This deliberately does **not** create a `pending` record. Cost alone
+    /// cannot describe a turn, and the notification also fires for autonomous
+    /// results that belong to no turn at all. The stashed value is consumed by
+    /// the next [`record_claude_turn`](Self::record_claude_turn).
+    ///
+    /// Because the value is never rebased outside a turn, cost accrued between
+    /// turns (autonomous results, session setup) rolls into the next published
+    /// turn rather than vanishing — so published turn costs sum to the session
+    /// total. That is the opposite of the goose path's out-of-turn rebasing,
+    /// and intentionally so: there, an out-of-turn notification is a
+    /// `session/new` setup artifact rather than real chargeable work.
+    ///
+    /// Non-finite values are dropped: they would poison every later delta.
+    pub(crate) fn record_claude_cost(&mut self, session_id: &str, cumulative_cost: f64) {
+        if !cumulative_cost.is_finite() || cumulative_cost < 0.0 {
+            return;
+        }
+        self.claude_sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .latest_cost = Some(cumulative_cost);
+    }
+
+    /// Record a completed Claude turn from the `session/prompt` response's
+    /// `usage` object, producing a publishable `pending` record.
+    ///
+    /// Called exactly once per turn, after the response settles. Unlike the
+    /// goose path there is no delta arithmetic on tokens: the adapter already
+    /// scopes them to the turn.
+    ///
+    /// `delta_reliable` is always `true` here — the token counts come straight
+    /// from the provider for this turn, so there is no scenario in which they
+    /// are a guess. A cost anomaly nulls the cost alone and leaves the token
+    /// counts standing; on the goose path a cost anomaly invalidates
+    /// everything, but only because there both figures derive from the same
+    /// cumulative counter. Discarding provider-direct token counts over an
+    /// unrelated cost glitch would be the worse failure.
+    pub(crate) fn record_claude_turn(&mut self, session_id: &str, usage: &PromptResponseUsage) {
+        // NIP-AM defines `inputTokens` as inclusive of cache reads and writes;
+        // the Anthropic API's `input_tokens` excludes both. Without this the
+        // input count would omit the cached majority of a long turn.
+        let turn_input = usage
+            .input_tokens
+            .saturating_add(usage.cached_read_tokens)
+            .saturating_add(usage.cached_write_tokens);
+
+        let state = self
+            .claude_sessions
+            .entry(session_id.to_string())
+            .or_default();
+
+        state.cum_input = state.cum_input.saturating_add(turn_input);
+        state.cum_output = state.cum_output.saturating_add(usage.output_tokens);
+        state.cum_cache_read = state
+            .cum_cache_read
+            .saturating_add(usage.cached_read_tokens);
+        state.cum_cache_write = state
+            .cum_cache_write
+            .saturating_add(usage.cached_write_tokens);
+
+        // Cost delta against the last published turn. A decrease means the
+        // provider's counter moved backwards (session restart, adapter
+        // remount) — report no cost rather than a negative or inflated one.
+        let turn_cost = match state.latest_cost {
+            Some(current) if current >= state.last_cost => Some(current - state.last_cost),
+            _ => None,
+        };
+
+        self.pending = Some(TurnUsage {
+            session_id: session_id.to_string(),
+            turn_seq: state.published_seq + 1,
+            delta_reliable: true,
+            turn_input_tokens: Some(turn_input),
+            turn_output_tokens: Some(usage.output_tokens),
+            // NIP-AM forbids a total derived by summing categories, and the
+            // adapter has no independent total to offer.
+            turn_total_tokens: None,
+            turn_cost_usd: turn_cost,
+            cumulative_input_tokens: state.cum_input,
+            cumulative_output_tokens: state.cum_output,
+            cumulative_total_tokens: None,
+            cumulative_cost_usd: state.latest_cost,
+            turn_cache_read_tokens: Some(usage.cached_read_tokens),
+            turn_cache_write_tokens: Some(usage.cached_write_tokens),
+            cumulative_cache_read_tokens: Some(state.cum_cache_read),
+            cumulative_cache_write_tokens: Some(state.cum_cache_write),
+            // The adapter's `usage` object carries no model id, and the
+            // notification's `_meta` does not either. Left unset rather than
+            // guessed from configuration, which can drift from the model the
+            // provider actually served.
+            model: None,
+        });
+        self.pending_source = Some(PendingSource::Claude);
+    }
+
     /// Consume and return the most recently computed turn usage record, then
     /// clear the in-flight marker and advance the committed baseline.
     ///
@@ -345,18 +573,40 @@ impl UsageTracker {
     pub(crate) fn take(&mut self) -> Option<TurnUsage> {
         self.in_flight_session = None;
         let record = self.pending.take()?;
+        let source = self.pending_source.take();
+
         // Advance the committed baseline to this published record so the
-        // *next* turn measures its delta from here.
-        self.sessions.insert(
-            record.session_id.clone(),
-            SessionState {
-                published_seq: record.turn_seq,
-                last_input: record.cumulative_input_tokens,
-                last_output: record.cumulative_output_tokens,
-                last_cost: record.cumulative_cost_usd,
-                last_total: record.cumulative_total_tokens,
-            },
-        );
+        // *next* turn measures its delta from here. Each path owns its own
+        // map; writing to the wrong one would seed a phantom baseline that the
+        // other path's delta arithmetic would silently measure from.
+        match source {
+            Some(PendingSource::Claude) => {
+                let state = self
+                    .claude_sessions
+                    .entry(record.session_id.clone())
+                    .or_default();
+                state.published_seq = record.turn_seq;
+                // Token sums already advanced in `record_claude_turn`; only the
+                // cost baseline waits until publish.
+                if let Some(cost) = record.cumulative_cost_usd {
+                    if cost >= state.last_cost {
+                        state.last_cost = cost;
+                    }
+                }
+            }
+            _ => {
+                self.sessions.insert(
+                    record.session_id.clone(),
+                    SessionState {
+                        published_seq: record.turn_seq,
+                        last_input: record.cumulative_input_tokens,
+                        last_output: record.cumulative_output_tokens,
+                        last_cost: record.cumulative_cost_usd,
+                        last_total: record.cumulative_total_tokens,
+                    },
+                );
+            }
+        }
         Some(record)
     }
 }
@@ -1110,6 +1360,404 @@ mod tests {
             usage.cumulative_total_tokens.is_none(),
             "goose-shaped payload must produce None cumulative_total_tokens"
         );
+    }
+
+    // ── Claude adapter path ────────────────────────────────────────────────
+
+    fn claude_usage(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) -> PromptResponseUsage {
+        PromptResponseUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_read_tokens: cache_read,
+            cached_write_tokens: cache_write,
+        }
+    }
+
+    /// The exact shape `sessionUsage()` puts on the `session/prompt` response.
+    /// A rename here would silently stop every Claude-runtime agent from
+    /// reporting — the failure this whole path exists to end.
+    #[test]
+    fn prompt_response_usage_deserializes_from_the_adapter_wire_shape() {
+        let u: PromptResponseUsage = serde_json::from_value(serde_json::json!({
+            "inputTokens": 1_234,
+            "outputTokens": 567,
+            "cachedReadTokens": 8_901,
+            "cachedWriteTokens": 234,
+            "totalTokens": 10_936,
+        }))
+        .expect("adapter payload must deserialize");
+        assert_eq!(u.input_tokens, 1_234);
+        assert_eq!(u.output_tokens, 567);
+        assert_eq!(u.cached_read_tokens, 8_901);
+        assert_eq!(u.cached_write_tokens, 234);
+    }
+
+    #[test]
+    fn prompt_response_usage_defaults_cache_fields_but_requires_core_counts() {
+        let u: PromptResponseUsage = serde_json::from_value(serde_json::json!({
+            "inputTokens": 10,
+            "outputTokens": 5,
+        }))
+        .expect("cache fields are optional");
+        assert_eq!(u.cached_read_tokens, 0);
+        assert_eq!(u.cached_write_tokens, 0);
+
+        // A shape change that drops the core counts must fail loudly at
+        // deserialization rather than defaulting to a free-looking turn.
+        let missing = serde_json::from_value::<PromptResponseUsage>(serde_json::json!({
+            "cachedReadTokens": 100,
+        }));
+        assert!(
+            missing.is_err(),
+            "absent inputTokens/outputTokens must not default to zero"
+        );
+    }
+
+    #[test]
+    fn claude_turn_input_is_cache_inclusive_per_nip_am() {
+        // NIP-AM's inputTokens includes cache reads/writes; Anthropic's does
+        // not. 200 fresh + 5000 read + 300 write = 5500.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_turn("c1", &claude_usage(200, 60, 5_000, 300));
+        let usage = tracker.take().expect("pending");
+
+        assert_eq!(usage.turn_input_tokens, Some(5_500));
+        assert_eq!(usage.turn_output_tokens, Some(60));
+        assert_eq!(usage.turn_cache_read_tokens, Some(5_000));
+        assert_eq!(usage.turn_cache_write_tokens, Some(300));
+        assert_eq!(usage.cumulative_input_tokens, 5_500);
+        assert_eq!(usage.cumulative_cache_read_tokens, Some(5_000));
+    }
+
+    #[test]
+    fn claude_first_turn_is_reliable_unlike_goose() {
+        // The goose path cannot know turn 1's delta. The Claude path is handed
+        // per-turn absolutes, so turn 1 is as trustworthy as any other.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let usage = tracker.take().expect("pending");
+
+        assert!(usage.delta_reliable, "turn 1 must be reliable");
+        assert_eq!(usage.turn_seq, 1);
+        assert_eq!(usage.turn_input_tokens, Some(100));
+    }
+
+    #[test]
+    fn claude_total_tokens_never_populated() {
+        // The adapter's totalTokens is a sum of the four categories; NIP-AM
+        // forbids publishing a derived total.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 5, 5));
+        let usage = tracker.take().expect("pending");
+        assert!(usage.turn_total_tokens.is_none());
+        assert!(usage.cumulative_total_tokens.is_none());
+    }
+
+    #[test]
+    fn claude_cumulative_tokens_accumulate_across_turns() {
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 10, 5));
+        let t1 = tracker.take().expect("t1");
+        assert_eq!(t1.cumulative_input_tokens, 115);
+
+        tracker.begin_turn("c1");
+        tracker.record_claude_turn("c1", &claude_usage(200, 30, 20, 0));
+        let t2 = tracker.take().expect("t2");
+
+        assert_eq!(t2.turn_seq, 2);
+        assert_eq!(t2.turn_input_tokens, Some(220), "turn is its own absolute");
+        assert_eq!(t2.cumulative_input_tokens, 335, "115 + 220");
+        assert_eq!(t2.cumulative_output_tokens, 50);
+        assert_eq!(t2.cumulative_cache_read_tokens, Some(30));
+        assert_eq!(t2.cumulative_cache_write_tokens, Some(5));
+    }
+
+    // ── Claude cost: cumulative in, per-turn out ───────────────────────────
+
+    #[test]
+    fn claude_turn_one_cost_is_the_full_cumulative_amount() {
+        // A fresh session starts at $0 (buzz-acp has no session/load path), so
+        // the first notification's cumulative value *is* turn 1's cost.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.05);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let usage = tracker.take().expect("pending");
+
+        let cost = usage.turn_cost_usd.expect("turn 1 cost");
+        assert!((cost - 0.05).abs() < 1e-9, "turn cost: {cost}");
+        assert_eq!(usage.cumulative_cost_usd, Some(0.05));
+    }
+
+    #[test]
+    fn claude_second_turn_cost_is_the_delta() {
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.05);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let _ = tracker.take();
+
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.12);
+        tracker.record_claude_turn("c1", &claude_usage(200, 40, 0, 0));
+        let usage = tracker.take().expect("pending");
+
+        let cost = usage.turn_cost_usd.expect("turn 2 cost");
+        assert!(
+            (cost - 0.07).abs() < 1e-9,
+            "cumulative cost must be differenced, not passed through: {cost}"
+        );
+        assert_eq!(usage.cumulative_cost_usd, Some(0.12));
+    }
+
+    #[test]
+    fn claude_multiple_cost_notifications_in_one_turn_take_the_last() {
+        // The adapter emits one usage_update per result message, and a turn can
+        // produce several.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.02);
+        tracker.record_claude_cost("c1", 0.05);
+        tracker.record_claude_cost("c1", 0.09);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let usage = tracker.take().expect("pending");
+
+        let cost = usage.turn_cost_usd.expect("cost");
+        assert!((cost - 0.09).abs() < 1e-9, "last cumulative wins: {cost}");
+    }
+
+    #[test]
+    fn claude_cost_decrease_nulls_cost_but_keeps_tokens_reliable() {
+        // Deliberate divergence from the goose path: there, a cost decrease
+        // invalidates the token counts too, because both derive from the same
+        // cumulative counter. Here the tokens are provider-direct per turn, so
+        // an unrelated cost glitch must not discard them.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.50);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let _ = tracker.take();
+
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.10); // counter moved backwards
+        tracker.record_claude_turn("c1", &claude_usage(300, 40, 0, 0));
+        let usage = tracker.take().expect("pending");
+
+        assert!(usage.delta_reliable, "tokens stay reliable");
+        assert_eq!(usage.turn_input_tokens, Some(300));
+        assert_eq!(usage.turn_output_tokens, Some(40));
+        assert!(
+            usage.turn_cost_usd.is_none(),
+            "no negative or inflated cost"
+        );
+    }
+
+    #[test]
+    fn claude_cost_baseline_does_not_regress_after_a_decrease() {
+        // After a backwards jump the baseline must hold at its high-water mark,
+        // or the next turn would bill the entire recovered amount again.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.50);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let _ = tracker.take();
+
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.10);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let _ = tracker.take();
+
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.55);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let usage = tracker.take().expect("pending");
+
+        let cost = usage.turn_cost_usd.expect("cost");
+        assert!(
+            (cost - 0.05).abs() < 1e-9,
+            "delta must be from the 0.50 high-water mark, not the 0.10 dip: {cost}"
+        );
+    }
+
+    #[test]
+    fn claude_turn_without_any_cost_notification_reports_tokens_only() {
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let usage = tracker.take().expect("pending");
+
+        assert!(usage.delta_reliable);
+        assert_eq!(usage.turn_input_tokens, Some(100));
+        assert!(usage.turn_cost_usd.is_none());
+        assert!(usage.cumulative_cost_usd.is_none());
+    }
+
+    #[test]
+    fn claude_non_finite_and_negative_costs_are_rejected() {
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", f64::NAN);
+        tracker.record_claude_cost("c1", f64::INFINITY);
+        tracker.record_claude_cost("c1", -1.0);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let usage = tracker.take().expect("pending");
+
+        assert!(
+            usage.cumulative_cost_usd.is_none(),
+            "a poisoned cost must never reach the payload"
+        );
+        assert!(usage.turn_cost_usd.is_none());
+    }
+
+    #[test]
+    fn claude_cost_between_turns_rolls_into_the_next_published_turn() {
+        // Autonomous results emit usage_update outside any turn. Their cost is
+        // real spend by this agent, so it must land in a turn rather than
+        // disappear — published turn costs should sum to the session total.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.10);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let t1 = tracker.take().expect("t1");
+
+        // Between turns: an autonomous result pushes the session total to 0.13.
+        tracker.record_claude_cost("c1", 0.13);
+
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.20);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let t2 = tracker.take().expect("t2");
+
+        let sum = t1.turn_cost_usd.unwrap() + t2.turn_cost_usd.unwrap();
+        assert!(
+            (sum - 0.20).abs() < 1e-9,
+            "turn costs must sum to the session total, not leak the 0.03: {sum}"
+        );
+    }
+
+    #[test]
+    fn claude_dropped_record_rolls_its_cost_into_the_next_turn() {
+        // A turn whose record is never taken (aborted before publish) must not
+        // lose its cost — the next published turn absorbs it.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.10);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        // No take(): the record is dropped by the next begin_turn.
+
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.18);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let usage = tracker.take().expect("pending");
+
+        let cost = usage.turn_cost_usd.expect("cost");
+        assert!(
+            (cost - 0.18).abs() < 1e-9,
+            "the dropped turn's 0.10 must roll forward, not vanish: {cost}"
+        );
+        assert_eq!(
+            usage.cumulative_input_tokens, 200,
+            "tokens from the dropped turn still count toward the session total"
+        );
+    }
+
+    // ── Path isolation: neither dialect may perturb the other ──────────────
+
+    #[test]
+    fn a_cost_notification_alone_never_produces_a_publishable_record() {
+        // This is what makes the new standard-`session/update` arm safe for
+        // goose: stashing a cost can never manufacture a turn.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("s1");
+        tracker.record_claude_cost("s1", 0.42);
+        assert!(
+            tracker.take().is_none(),
+            "cost without a prompt-response usage object must publish nothing"
+        );
+    }
+
+    #[test]
+    fn claude_turns_do_not_seed_goose_baseline_state() {
+        // take() must advance only the map its record came from. A phantom
+        // goose SessionState would silently become the baseline for a later
+        // goose delta.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("c1");
+        tracker.record_claude_cost("c1", 0.05);
+        tracker.record_claude_turn("c1", &claude_usage(100, 20, 0, 0));
+        let _ = tracker.take();
+
+        assert!(
+            !tracker.sessions.contains_key("c1"),
+            "goose state must stay untouched by a Claude turn"
+        );
+        assert!(tracker.claude_sessions.contains_key("c1"));
+    }
+
+    #[test]
+    fn goose_turns_do_not_seed_claude_state() {
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("g1");
+        tracker.record("g1", &payload(1000, 200, Some(0.01)));
+        let _ = tracker.take();
+
+        assert!(
+            !tracker.claude_sessions.contains_key("g1"),
+            "Claude state must stay untouched by a goose turn"
+        );
+        assert!(tracker.sessions.contains_key("g1"));
+    }
+
+    #[test]
+    fn a_stray_claude_cost_does_not_disturb_a_goose_sessions_delta() {
+        // Belt-and-braces for the case I could not rule out by inspection: a
+        // goose build that also emits usage_update on the standard channel.
+        // The stray cost must not touch goose's cost baseline.
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("g1");
+        tracker.record("g1", &payload(1000, 200, Some(0.01)));
+        let _ = tracker.take();
+
+        tracker.begin_turn("g1");
+        tracker.record_claude_cost("g1", 99.0); // stray, from the other channel
+        tracker.record("g1", &payload(1800, 450, Some(0.018)));
+        let usage = tracker.take().expect("pending");
+
+        assert!(usage.delta_reliable);
+        assert_eq!(usage.turn_input_tokens, Some(800));
+        let cost = usage.turn_cost_usd.expect("cost");
+        assert!(
+            (cost - 0.008).abs() < 1e-9,
+            "goose cost delta must ignore the stray Claude value: {cost}"
+        );
+    }
+
+    #[test]
+    fn claude_sessions_are_independent_of_each_other() {
+        let mut tracker = UsageTracker::default();
+        tracker.begin_turn("a");
+        tracker.record_claude_cost("a", 0.10);
+        tracker.record_claude_turn("a", &claude_usage(100, 20, 0, 0));
+        let _ = tracker.take();
+
+        tracker.begin_turn("b");
+        tracker.record_claude_cost("b", 0.03);
+        tracker.record_claude_turn("b", &claude_usage(50, 10, 0, 0));
+        let b1 = tracker.take().expect("b1");
+
+        assert_eq!(b1.turn_seq, 1, "b has its own sequence");
+        assert_eq!(b1.cumulative_input_tokens, 50, "b has its own totals");
+        let cost = b1.turn_cost_usd.expect("cost");
+        assert!((cost - 0.03).abs() < 1e-9, "b has its own cost baseline");
     }
 
     #[test]
