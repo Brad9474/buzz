@@ -36,6 +36,9 @@ pub mod presence;
 pub mod relay;
 /// Tenant identity — the server-resolved community key carried on scoped paths.
 pub mod tenant;
+
+/// Per-agent token and cost accounting over kind 44200 turn metrics.
+pub mod usage_rollup;
 /// Schnorr signature and event ID verification.
 pub mod verification;
 

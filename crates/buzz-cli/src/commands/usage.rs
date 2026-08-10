@@ -1,4 +1,10 @@
-//! Per-agent token and cost rollup from NIP-AM kind 44200 agent turn metrics.
+//! `buzz usage` — per-agent token and cost rollup, rendered for a terminal or
+//! posted into a channel.
+//!
+//! The accounting itself lives in [`buzz_core::usage_rollup`], shared with Buzz
+//! Desktop's usage panel so the two surfaces can never disagree about what a
+//! turn cost. What remains here is the CLI's own concerns: fetching, resolving
+//! display names, Markdown rendering, and the two subcommands.
 //!
 //! # Who can read what
 //!
@@ -7,183 +13,17 @@
 //! the caller's *own* pubkey, so the command is structurally incapable of
 //! surfacing another identity's spend — an agent running it against its own key
 //! sees an empty table, not somebody else's numbers. That is the whole reason
-//! the digest lives here rather than in a relay-side workflow, which never
-//! holds the owner's key.
-//!
-//! # Why totals come from cumulative counts, not per-turn deltas
-//!
-//! Each payload carries both a per-turn count and a session-cumulative count.
-//! Summing the per-turn figures looks like the obvious move and quietly
-//! undercounts: `turn` is `None` whenever `delta_reliable` is false (every
-//! goose session's first turn), and a turn whose record was dropped before
-//! publishing never contributes one at all. The session-cumulative figure
-//! carries those tokens regardless.
-//!
-//! So the rollup takes the **last** metric of each session — the one with the
-//! highest `turnSeq` — reads its cumulative counts, and sums those across
-//! sessions. Cumulative is per-session, never per-agent, so summing across
-//! sessions is correct and summing across *turns* would multiply-count the
-//! whole session on every turn.
-//!
-//! There is no total-tokens column: NIP-AM forbids a total derived by summing
-//! categories, and no provider on either path reports an independent one.
+//! this is a local command rather than a relay-side workflow, which never holds
+//! the owner's key.
 
 use std::collections::HashMap;
 
-use buzz_core::agent_turn_metric::{
-    decrypt_agent_turn_metric, AgentTurnMetricPayload, TokenCounts,
-};
 use buzz_core::kind::KIND_AGENT_TURN_METRIC;
+use buzz_core::usage_rollup::{entries_from_events, rollup, AgentRollup};
 
 use crate::client::{normalize_write_response, BuzzClient};
 use crate::error::CliError;
 use crate::validate::parse_uuid;
-
-/// One kind-44200 event, with its payload decrypted if that succeeded.
-///
-/// The `agent` tag is plaintext, so an event whose ciphertext we cannot read is
-/// still attributable — it is reported as an undecryptable turn for that agent
-/// rather than vanishing from the count.
-#[derive(Debug, Clone)]
-pub struct MetricEntry {
-    /// Hex pubkey of the agent that produced the turn.
-    pub agent_pubkey: String,
-    /// Event `created_at`, used only to break `turnSeq` ties.
-    pub created_at: u64,
-    /// `None` when the event could not be decrypted or failed validation.
-    pub payload: Option<AgentTurnMetricPayload>,
-}
-
-/// Rolled-up totals for a single agent.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct AgentRollup {
-    pub agent_pubkey: String,
-    /// Turns whose payload was read successfully.
-    pub turns: u64,
-    /// Distinct sessions contributing to these totals.
-    pub sessions: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub cost_usd: f64,
-    /// Turns attributable to this agent whose payload could not be read.
-    /// Their tokens are absent from the totals above; surfaced so an
-    /// undercount is visible rather than silent.
-    pub undecryptable_turns: u64,
-}
-
-/// Fold metric entries into one rollup per agent, ordered by cost descending
-/// (ties broken by pubkey so the output is stable).
-///
-/// Pure over its input so the accounting can be tested without a relay or any
-/// key material.
-pub fn rollup(entries: &[MetricEntry]) -> Vec<AgentRollup> {
-    // agent -> session key -> that session's metrics
-    let mut by_agent: HashMap<&str, HashMap<String, Vec<&MetricEntry>>> = HashMap::new();
-    let mut undecryptable: HashMap<&str, u64> = HashMap::new();
-
-    for entry in entries {
-        match &entry.payload {
-            None => {
-                *undecryptable.entry(&entry.agent_pubkey).or_default() += 1;
-            }
-            Some(payload) => {
-                // A payload without a session id cannot be grouped with
-                // anything, so it becomes its own session. Keying on the turn
-                // id keeps two such payloads from colliding and silently
-                // discarding one.
-                let key = payload.session_id.clone().unwrap_or_else(|| {
-                    format!(
-                        "\u{0}orphan:{}:{}",
-                        payload.turn_id.as_deref().unwrap_or(""),
-                        entry.created_at
-                    )
-                });
-                by_agent
-                    .entry(&entry.agent_pubkey)
-                    .or_default()
-                    .entry(key)
-                    .or_default()
-                    .push(entry);
-            }
-        }
-    }
-
-    let mut rollups: Vec<AgentRollup> = Vec::new();
-    let agents: std::collections::BTreeSet<&str> = by_agent
-        .keys()
-        .copied()
-        .chain(undecryptable.keys().copied())
-        .collect();
-
-    for agent in agents {
-        let mut out = AgentRollup {
-            agent_pubkey: agent.to_string(),
-            undecryptable_turns: undecryptable.get(agent).copied().unwrap_or(0),
-            ..Default::default()
-        };
-
-        if let Some(sessions) = by_agent.get(agent) {
-            out.sessions = sessions.len() as u64;
-            for turns in sessions.values() {
-                out.turns += turns.len() as u64;
-                accumulate_session(&mut out, turns);
-            }
-        }
-        rollups.push(out);
-    }
-
-    rollups.sort_by(|a, b| {
-        b.cost_usd
-            .partial_cmp(&a.cost_usd)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.agent_pubkey.cmp(&b.agent_pubkey))
-    });
-    rollups
-}
-
-/// Add one session's totals to `out`.
-///
-/// Prefers the cumulative counts on the session's final metric. Falls back to
-/// summing per-turn counts only when that metric carries no cumulative block at
-/// all — a shape our own publisher never emits, but the field is optional in
-/// NIP-AM and silently contributing zero would be worse than an approximation.
-fn accumulate_session(out: &mut AgentRollup, turns: &[&MetricEntry]) {
-    let last = turns
-        .iter()
-        .filter_map(|e| e.payload.as_ref().map(|p| (p, e.created_at)))
-        .max_by_key(|(p, created_at)| (p.turn_seq.unwrap_or(0), *created_at));
-
-    match last.and_then(|(p, _)| p.cumulative.as_ref()) {
-        Some(counts) => add_counts(out, counts),
-        None => {
-            for entry in turns {
-                if let Some(counts) = entry.payload.as_ref().and_then(|p| p.turn.as_ref()) {
-                    add_counts(out, counts);
-                }
-            }
-        }
-    }
-}
-
-fn add_counts(out: &mut AgentRollup, counts: &TokenCounts) {
-    out.input_tokens = out
-        .input_tokens
-        .saturating_add(counts.input_tokens.unwrap_or(0));
-    out.output_tokens = out
-        .output_tokens
-        .saturating_add(counts.output_tokens.unwrap_or(0));
-    out.cache_read_tokens = out
-        .cache_read_tokens
-        .saturating_add(counts.cache_read_tokens.unwrap_or(0));
-    out.cache_write_tokens = out
-        .cache_write_tokens
-        .saturating_add(counts.cache_write_tokens.unwrap_or(0));
-    // `validate()` has already rejected negative and non-finite costs, so this
-    // cannot poison the total.
-    out.cost_usd += counts.cost_usd.unwrap_or(0.0);
-}
 
 /// Format an integer with thousands separators.
 fn thousands(n: u64) -> String {
@@ -307,7 +147,7 @@ pub fn render_markdown(
 async fn fetch_entries(
     client: &BuzzClient,
     since: Option<i64>,
-) -> Result<Vec<MetricEntry>, CliError> {
+) -> Result<Vec<buzz_core::usage_rollup::MetricEntry>, CliError> {
     let my_pk = client.keys().public_key().to_hex();
     let mut filter = serde_json::json!({
         "kinds": [KIND_AGENT_TURN_METRIC],
@@ -318,39 +158,14 @@ async fn fetch_entries(
     }
 
     let raw = client.query_all(filter).await?;
-    Ok(entries_from_events(client.keys(), &raw))
-}
-
-/// Convert raw relay events into [`MetricEntry`] values, decrypting each with
-/// `keys`.
-///
-/// Split from [`fetch_entries`] so the decrypt-and-attribute step can be tested
-/// against genuinely encrypted events rather than hand-built structs — the HTTP
-/// call is the only part left untested.
-fn entries_from_events(keys: &nostr::Keys, raw: &[serde_json::Value]) -> Vec<MetricEntry> {
-    let mut entries = Vec::with_capacity(raw.len());
-    for value in raw {
-        let Ok(event) = serde_json::from_value::<nostr::Event>(value.clone()) else {
-            // Not a well-formed event: nothing to attribute it to, so it cannot
-            // even be counted as an undecryptable turn.
-            continue;
-        };
-        // The `agent` tag is the publisher's own identity; fall back to the
-        // event author, which is the same key in every event we publish.
-        let agent_pubkey = crate::client::extract_tag_value(value, "agent");
-        let agent_pubkey = if agent_pubkey.is_empty() {
-            event.pubkey.to_hex()
-        } else {
-            agent_pubkey
-        };
-        let payload = decrypt_agent_turn_metric(keys, &event).ok();
-        entries.push(MetricEntry {
-            agent_pubkey,
-            created_at: event.created_at.as_secs(),
-            payload,
-        });
-    }
-    entries
+    // A value that will not parse as an event has no `agent` tag to attribute
+    // it to, so it cannot even be reported as an undecryptable turn — dropping
+    // it is the only honest option.
+    let events: Vec<nostr::Event> = raw
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect();
+    Ok(entries_from_events(client.keys(), &events))
 }
 
 /// Resolve display names for the agents present in the rollup.
@@ -487,6 +302,8 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_core::agent_turn_metric::{AgentTurnMetricPayload, TokenCounts};
+    use buzz_core::usage_rollup::MetricEntry;
 
     fn counts(input: u64, output: u64, read: u64, write: u64, cost: f64) -> TokenCounts {
         TokenCounts {
@@ -523,177 +340,6 @@ mod tests {
                 stop_reason: None,
             }),
         }
-    }
-
-    /// The core accounting rule: cumulative counts are per-session running
-    /// totals, so a session contributes its final metric once — not once per
-    /// turn. Getting this wrong inflates every figure by roughly the turn count.
-    #[test]
-    fn a_session_contributes_its_final_cumulative_once() {
-        let entries = vec![
-            entry(
-                "a",
-                Some("s1"),
-                1,
-                Some(counts(100, 10, 0, 0, 0.01)),
-                Some(counts(100, 10, 0, 0, 0.01)),
-            ),
-            entry(
-                "a",
-                Some("s1"),
-                2,
-                Some(counts(200, 20, 0, 0, 0.02)),
-                Some(counts(300, 30, 0, 0, 0.03)),
-            ),
-            entry(
-                "a",
-                Some("s1"),
-                3,
-                Some(counts(150, 15, 0, 0, 0.015)),
-                Some(counts(450, 45, 0, 0, 0.045)),
-            ),
-        ];
-        let out = rollup(&entries);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].turns, 3);
-        assert_eq!(out[0].sessions, 1);
-        assert_eq!(
-            out[0].input_tokens, 450,
-            "final cumulative, not the sum of all three"
-        );
-        assert_eq!(out[0].output_tokens, 45);
-        assert!((out[0].cost_usd - 0.045).abs() < 1e-9);
-    }
-
-    /// Out-of-order arrival must not change the answer — the highest turnSeq
-    /// wins, not the last one seen.
-    #[test]
-    fn the_highest_turn_seq_wins_regardless_of_order() {
-        let entries = vec![
-            entry("a", Some("s1"), 3, None, Some(counts(450, 45, 0, 0, 0.045))),
-            entry("a", Some("s1"), 1, None, Some(counts(100, 10, 0, 0, 0.01))),
-            entry("a", Some("s1"), 2, None, Some(counts(300, 30, 0, 0, 0.03))),
-        ];
-        let out = rollup(&entries);
-        assert_eq!(out[0].input_tokens, 450);
-    }
-
-    #[test]
-    fn sessions_sum_but_agents_stay_separate() {
-        let entries = vec![
-            entry("a", Some("s1"), 1, None, Some(counts(100, 10, 5, 1, 0.01))),
-            entry("a", Some("s2"), 1, None, Some(counts(200, 20, 7, 2, 0.02))),
-            entry("b", Some("s3"), 1, None, Some(counts(50, 5, 0, 0, 0.005))),
-        ];
-        let out = rollup(&entries);
-        assert_eq!(out.len(), 2);
-        let a = out.iter().find(|r| r.agent_pubkey == "a").expect("agent a");
-        assert_eq!(a.sessions, 2);
-        assert_eq!(a.input_tokens, 300);
-        assert_eq!(a.cache_read_tokens, 12);
-        assert_eq!(a.cache_write_tokens, 3);
-        let b = out.iter().find(|r| r.agent_pubkey == "b").expect("agent b");
-        assert_eq!(b.input_tokens, 50);
-    }
-
-    /// A goose first turn has `turn: None` but a populated cumulative. Reading
-    /// per-turn counts would drop it; reading cumulative keeps it.
-    #[test]
-    fn a_turn_with_no_per_turn_delta_still_counts() {
-        let entries = vec![entry(
-            "a",
-            Some("s1"),
-            1,
-            None,
-            Some(counts(1_000, 200, 0, 0, 0.05)),
-        )];
-        let out = rollup(&entries);
-        assert_eq!(out[0].input_tokens, 1_000);
-        assert!((out[0].cost_usd - 0.05).abs() < 1e-9);
-    }
-
-    /// Cumulative is optional in NIP-AM. When it is genuinely absent the
-    /// fallback sums per-turn counts rather than contributing nothing.
-    #[test]
-    fn missing_cumulative_falls_back_to_summing_turns() {
-        let entries = vec![
-            entry("a", Some("s1"), 1, Some(counts(100, 10, 0, 0, 0.01)), None),
-            entry("a", Some("s1"), 2, Some(counts(200, 20, 0, 0, 0.02)), None),
-        ];
-        let out = rollup(&entries);
-        assert_eq!(out[0].input_tokens, 300);
-        assert!((out[0].cost_usd - 0.03).abs() < 1e-9);
-    }
-
-    /// Two payloads with no session id must not collide into one bucket and
-    /// lose a turn.
-    #[test]
-    fn payloads_without_a_session_id_are_counted_separately() {
-        let entries = vec![
-            entry("a", None, 1, None, Some(counts(100, 10, 0, 0, 0.01))),
-            entry("a", None, 2, None, Some(counts(200, 20, 0, 0, 0.02))),
-        ];
-        let out = rollup(&entries);
-        assert_eq!(out[0].turns, 2);
-        assert_eq!(out[0].sessions, 2);
-        assert_eq!(out[0].input_tokens, 300);
-    }
-
-    /// An unreadable payload is still a turn that happened. It must surface as
-    /// an explicit exclusion, not disappear into a total that looks complete.
-    #[test]
-    fn undecryptable_turns_are_reported_not_swallowed() {
-        let entries = vec![
-            entry("a", Some("s1"), 1, None, Some(counts(100, 10, 0, 0, 0.01))),
-            MetricEntry {
-                agent_pubkey: "a".to_string(),
-                created_at: 1_002,
-                payload: None,
-            },
-        ];
-        let out = rollup(&entries);
-        assert_eq!(out[0].turns, 1, "only readable turns feed the totals");
-        assert_eq!(out[0].undecryptable_turns, 1);
-
-        let md = render_markdown(&out, &HashMap::new(), "2026-08-08T00:00:00Z");
-        assert!(
-            md.contains("could not be decrypted"),
-            "the exclusion must be visible in the rendered digest:\n{md}"
-        );
-    }
-
-    /// An agent whose every turn is unreadable must still appear, or it would
-    /// look like it had simply been idle.
-    #[test]
-    fn an_agent_with_only_undecryptable_turns_still_appears() {
-        let entries = vec![MetricEntry {
-            agent_pubkey: "ghost".to_string(),
-            created_at: 1_000,
-            payload: None,
-        }];
-        let out = rollup(&entries);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].agent_pubkey, "ghost");
-        assert_eq!(out[0].turns, 0);
-        assert_eq!(out[0].undecryptable_turns, 1);
-    }
-
-    #[test]
-    fn rollups_are_ordered_by_cost_descending() {
-        let entries = vec![
-            entry(
-                "cheap",
-                Some("s1"),
-                1,
-                None,
-                Some(counts(10, 1, 0, 0, 0.001)),
-            ),
-            entry("dear", Some("s2"), 1, None, Some(counts(10, 1, 0, 0, 5.0))),
-            entry("mid", Some("s3"), 1, None, Some(counts(10, 1, 0, 0, 1.0))),
-        ];
-        let out = rollup(&entries);
-        let order: Vec<&str> = out.iter().map(|r| r.agent_pubkey.as_str()).collect();
-        assert_eq!(order, vec!["dear", "mid", "cheap"]);
     }
 
     #[test]
@@ -742,126 +388,6 @@ mod tests {
         );
     }
 
-    // ── Real crypto: a signed, encrypted event all the way to a rollup ─────
-
-    /// Build a real kind-44200 event: NIP-AM payload, NIP-44 encrypted to
-    /// `owner`, signed by `agent`, tagged the way `publish_agent_turn_metric`
-    /// tags it.
-    fn signed_metric_event(
-        agent: &nostr::Keys,
-        owner: &nostr::PublicKey,
-        session: &str,
-        turn_seq: u64,
-        cumulative: TokenCounts,
-    ) -> serde_json::Value {
-        use nostr::{EventBuilder, Kind, Tag};
-
-        let payload = AgentTurnMetricPayload {
-            harness: "claude".to_string(),
-            model: None,
-            channel_id: None,
-            session_id: Some(session.to_string()),
-            turn_id: Some(format!("turn-{turn_seq}")),
-            turn_seq: Some(turn_seq),
-            timestamp: "2026-08-08T00:00:00.000Z".to_string(),
-            turn: None,
-            cumulative: Some(cumulative),
-            delta_reliable: true,
-            stop_reason: None,
-        };
-        let ciphertext =
-            buzz_core::agent_turn_metric::encrypt_agent_turn_metric(agent, owner, &payload)
-                .expect("encrypt");
-        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_TURN_METRIC as u16), ciphertext)
-            .tags([
-                Tag::parse(["p", &owner.to_hex()]).expect("p tag"),
-                Tag::parse(["agent", &agent.public_key().to_hex()]).expect("agent tag"),
-            ])
-            .sign_with_keys(agent)
-            .expect("sign");
-        serde_json::to_value(event).expect("event to json")
-    }
-
-    #[test]
-    fn genuinely_encrypted_events_decrypt_and_roll_up() {
-        let agent = nostr::Keys::generate();
-        let owner = nostr::Keys::generate();
-
-        let raw = vec![
-            signed_metric_event(
-                &agent,
-                &owner.public_key(),
-                "s1",
-                1,
-                counts(100, 10, 40, 5, 0.01),
-            ),
-            signed_metric_event(
-                &agent,
-                &owner.public_key(),
-                "s1",
-                2,
-                counts(300, 30, 120, 9, 0.04),
-            ),
-        ];
-
-        let entries = entries_from_events(&owner, &raw);
-        assert_eq!(entries.len(), 2);
-        assert!(
-            entries.iter().all(|e| e.payload.is_some()),
-            "the owner's key must decrypt its own metrics"
-        );
-        assert_eq!(entries[0].agent_pubkey, agent.public_key().to_hex());
-
-        let out = rollup(&entries);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].turns, 2);
-        assert_eq!(out[0].input_tokens, 300, "session cumulative, not 100+300");
-        assert_eq!(out[0].cache_read_tokens, 120);
-        assert!((out[0].cost_usd - 0.04).abs() < 1e-9);
-    }
-
-    /// The gate that makes this command safe to ship in a shared CLI: another
-    /// identity's metrics are unreadable even when the events are handed
-    /// straight to it, with no relay in the way.
-    #[test]
-    fn another_identity_cannot_decrypt_the_owners_metrics() {
-        let agent = nostr::Keys::generate();
-        let owner = nostr::Keys::generate();
-        let eavesdropper = nostr::Keys::generate();
-
-        let raw = vec![signed_metric_event(
-            &agent,
-            &owner.public_key(),
-            "s1",
-            1,
-            counts(100, 10, 0, 0, 0.01),
-        )];
-
-        let entries = entries_from_events(&eavesdropper, &raw);
-        assert_eq!(entries.len(), 1);
-        assert!(
-            entries[0].payload.is_none(),
-            "a non-owner must never read the plaintext"
-        );
-
-        let out = rollup(&entries);
-        assert_eq!(out[0].turns, 0, "no readable turns");
-        assert_eq!(out[0].undecryptable_turns, 1);
-        assert_eq!(out[0].cost_usd, 0.0);
-    }
-
-    #[test]
-    fn malformed_events_are_skipped_without_panicking() {
-        let owner = nostr::Keys::generate();
-        let raw = vec![
-            serde_json::json!({"not": "an event"}),
-            serde_json::json!(null),
-        ];
-        assert!(entries_from_events(&owner, &raw).is_empty());
-    }
-
-    /// A profile name is written by the agent itself. A pipe would add phantom
-    /// columns and a newline would truncate the table, hiding every agent below
     /// it — so one careless profile must not be able to break the digest.
     #[test]
     fn hostile_display_names_cannot_break_the_table() {
