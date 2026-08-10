@@ -18,6 +18,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = ["system-keyring"]
+# Embeds the built frontend instead of loading `build.devUrl` at runtime.
+# `tauri build` turns this on for itself (it passes `--features
+# tauri/custom-protocol`); a bare `cargo build --release` does not, and the
+# result is a release binary with no UI in it. Declared here so that driving
+# cargo directly stays possible: `cargo build --release --features
+# custom-protocol`. The guard in build.rs reads DEP_TAURI_DEV, so it sees
+# either route. DO NOT REMOVE.
+custom-protocol = ["tauri/custom-protocol"]
 mesh-llm = ["dep:iroh", "dep:mesh-llm-sdk", "dep:mesh-llm-host-runtime", "dep:mesh-llm-client", "dep:mesh-llm-node", "dep:mesh-llm-system", "dep:mesh-llm-events"]
 # OS keyring backing for desktop secret storage (nsec private keys). When
 # disabled, secrets fall back to 0o600 files. On by default for real builds.

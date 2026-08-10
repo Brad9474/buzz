@@ -4,7 +4,102 @@ include!("src/commands/reconnect_hook_config.rs");
 
 use base64::Engine as _;
 
+/// Refuse to produce a release binary with no frontend inside it.
+///
+/// Tauri decides between "embed `frontendDist`" and "load `build.devUrl` at
+/// runtime" from a Cargo feature, not from the profile:
+///
+///   tauri/build.rs   `let dev = !has_feature("custom-protocol");`
+///                    `println!("cargo:dev={dev}");`
+///   tauri-macros     `dev: cfg!(not(feature = "custom-protocol"))`
+///   tauri-codegen    `else if dev && config.build.dev_url.is_some() {
+///                        EmbeddedAssets::default()  // empty
+///                    }`
+///
+/// `tauri build` turns the feature on (it passes `--features
+/// tauri/custom-protocol`). A bare `cargo build --release` does not, and the
+/// result is an optimised binary carrying zero web assets that silently points
+/// WebView2 at `build.devUrl` (`http://localhost:1420`). It compiles clean, it
+/// is byte-identical to itself across copies, and it passes any hash or string
+/// check you throw at it -- then renders an empty ERR_CONNECTION_REFUSED
+/// window on a machine with no dev server running.
+///
+/// That shipped to the fleet on 2026-08-10. The only cheap signal was the
+/// missing ~8.5 MB of assets. Fail at build time instead.
+///
+/// The signal used here is `DEP_TAURI_DEV`. `tauri` declares `links = "Tauri"`,
+/// so its `cargo:dev=<bool>` instruction reaches direct dependents as that
+/// variable -- it is the same value tauri-codegen branches on, read from the
+/// same source, rather than an inference about how the build was invoked.
+/// Checking this crate's own `CARGO_FEATURE_CUSTOM_PROTOCOL` does NOT work:
+/// the CLI enables the feature on the `tauri` dependency, not on us.
+///
+/// Note this deliberately does NOT assert on `devUrl` being set: `devUrl` is
+/// always set and must stay set for `tauri dev`. The feature is the real
+/// switch.
+///
+/// Escape hatch: set BUZZ_ALLOW_RELEASE_WITHOUT_FRONTEND=1 for a
+/// release-profile build that genuinely does not need a UI (profiling a
+/// sidecar path, `cargo test --release`, bisecting a codegen bug).
+fn assert_frontend_will_be_embedded() {
+    println!("cargo:rerun-if-env-changed=BUZZ_ALLOW_RELEASE_WITHOUT_FRONTEND");
+
+    if std::env::var("PROFILE").as_deref() != Ok("release")
+        || std::env::var_os("BUZZ_ALLOW_RELEASE_WITHOUT_FRONTEND").is_some()
+    {
+        return;
+    }
+
+    match std::env::var("DEP_TAURI_DEV").as_deref() {
+        // Frontend will be embedded. This is what a correct release build looks like.
+        Ok("false") => {}
+        Ok("true") => panic!(
+            "\n\
+             ------------------------------------------------------------------\n\
+             REFUSING TO BUILD: release profile in Tauri dev-loading mode.\n\
+             \n\
+             DEP_TAURI_DEV=true means the `custom-protocol` feature is off, so\n\
+             tauri-codegen will embed NO frontend assets and the app will load\n\
+             build.devUrl (http://localhost:1420) at runtime -- a blank\n\
+             ERR_CONNECTION_REFUSED window on any machine without a dev\n\
+             server. It builds and hashes clean, so nothing downstream\n\
+             catches it. This shipped on 2026-08-10.\n\
+             \n\
+             Build the desktop app through the Tauri CLI, which enables the\n\
+             feature and builds the frontend first:\n\
+             \n\
+                 cd desktop && pnpm tauri build\n\
+                 just desktop-release-build <target>\n\
+             \n\
+             Or, to drive cargo directly:\n\
+             \n\
+                 cargo build --release --features custom-protocol\n\
+             \n\
+             If you really want a UI-less release binary, set\n\
+             BUZZ_ALLOW_RELEASE_WITHOUT_FRONTEND=1.\n\
+             ------------------------------------------------------------------\n"
+        ),
+        other => panic!(
+            "\n\
+             ------------------------------------------------------------------\n\
+             REFUSING TO BUILD: could not determine whether the frontend will\n\
+             be embedded. Expected DEP_TAURI_DEV to be \"true\" or \"false\",\n\
+             got {other:?}.\n\
+             \n\
+             That variable comes from tauri's `cargo:dev` instruction via\n\
+             `links = \"Tauri\"`. If a tauri upgrade changed or dropped it,\n\
+             this guard needs updating -- do not just delete it, or the\n\
+             2026-08-10 blank-window failure can ship again unnoticed.\n\
+             \n\
+             To build anyway: BUZZ_ALLOW_RELEASE_WITHOUT_FRONTEND=1.\n\
+             ------------------------------------------------------------------\n"
+        ),
+    }
+}
+
 fn main() {
+    assert_frontend_will_be_embedded();
+
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_URL");
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_HTTP");
     println!("cargo:rerun-if-env-changed=BUZZ_UPDATER_PUBLIC_KEY");
