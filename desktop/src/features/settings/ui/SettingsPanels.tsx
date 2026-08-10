@@ -6,6 +6,7 @@ import {
   Bot,
   Check,
   ChevronDown,
+  CircleDollarSign,
   Cpu,
   Download,
   FlaskConical,
@@ -83,6 +84,7 @@ import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
+import { AgentUsageCard } from "./AgentUsageCard";
 
 export type SettingsSection =
   | "profile"
@@ -98,6 +100,7 @@ export type SettingsSection =
   | "moderation"
   | "custom-emoji"
   | "local-archive"
+  | "agent-usage"
   | "mobile"
   | "updates";
 
@@ -117,6 +120,7 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "moderation",
   "custom-emoji",
   "local-archive",
+  "agent-usage",
   "mobile",
   "updates",
 ];
@@ -219,6 +223,11 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     value: "local-archive",
     label: "Local archive",
     icon: Archive,
+  },
+  {
+    value: "agent-usage",
+    label: "Agent usage",
+    icon: CircleDollarSign,
   },
   {
     value: "mobile",
@@ -837,6 +846,8 @@ export function renderSettingsSection(
       return <CustomEmojiSettingsCard />;
     case "local-archive":
       return <LocalArchiveSettingsCard />;
+    case "agent-usage":
+      return <AgentUsageCard />;
     case "mobile":
       return <MobilePairingCard currentPubkey={props.currentPubkey} />;
     case "updates":

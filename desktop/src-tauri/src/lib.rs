@@ -892,6 +892,7 @@ pub fn run() {
             relay_reconnect_hook_configured,
             observer_archive_default_enabled,
             agent_metric_archive_default_enabled,
+            agent_usage_rollup,
             archive::archive_events,
             archive::create_save_subscription,
             archive::merge_save_subscription_kinds,
