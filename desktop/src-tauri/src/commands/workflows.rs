@@ -70,28 +70,32 @@ pub async fn get_channel_workflows(
 ///
 /// The Workflows overview screen previously issued one `get_channel_workflows`
 /// query per member channel (`Promise.all` fanout in `WorkflowsView`), i.e. N
-/// relay POSTs. A nostr `#h` filter matches ANY of its listed values, so one
-/// query with all channel ids returns the same set. Each `WorkflowWire` carries
-/// its own `channel_id` (from the event's `h` tag), so the frontend can still
-/// group results by channel. Neither this nor the per-channel command sets a
-/// `limit`, so batching does not change result completeness.
+/// relay POSTs. This sends N filters in ONE POST instead — `/query` takes an
+/// array of filters and runs them concurrently, so the round-trip saving is
+/// kept. Each `WorkflowWire` carries its own `channel_id` (from the event's
+/// `h` tag), so the frontend can still group results by channel. No filter
+/// sets a `limit`, so the split does not change result completeness.
+///
+/// One filter per channel — NOT one filter listing every channel in a single
+/// `#h`. A multi-value `#h` looks equivalent (nostr tag filters match ANY
+/// listed value) but is not, because the relay narrows a multi-`#h` filter to
+/// exactly one channel: `req::extract_channel_id_from_filter` returns the
+/// *first* parseable `#h` value rather than `None`, and that value is pushed
+/// into SQL as `AND channel_id = $n`. `#h` values arrive in a `BTreeSet`, so
+/// "first" is the lexicographically smallest channel id — every other
+/// channel's workflows are dropped, silently and with a 200. Keeping each
+/// filter single-valued keeps it on the pushdown path this command relies on.
 #[tauri::command]
 pub async fn get_channels_workflows(
     channel_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<WorkflowWire>, String> {
-    if channel_ids.is_empty() {
+    let filters = workflow_filters_for_channels(&channel_ids);
+    if filters.is_empty() {
         return Ok(Vec::new());
     }
 
-    let events = query_relay(
-        &state,
-        &[serde_json::json!({
-            "kinds": [30620],
-            "#h": channel_ids,
-        })],
-    )
-    .await?;
+    let events = query_relay(&state, &filters).await?;
 
     Ok(events.iter().map(workflow_from_event).collect())
 }
@@ -299,6 +303,23 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default()
+}
+
+/// One kind:30620 filter per channel id, each with a single-valued `#h`.
+///
+/// Single-valued is load-bearing, not stylistic — see the note on
+/// [`get_channels_workflows`]. Empty in → empty out, so callers can treat an
+/// empty result as "nothing to ask" without a separate guard.
+fn workflow_filters_for_channels(channel_ids: &[String]) -> Vec<Value> {
+    channel_ids
+        .iter()
+        .map(|channel_id| {
+            serde_json::json!({
+                "kinds": [30620],
+                "#h": [channel_id],
+            })
+        })
+        .collect()
 }
 
 /// First value of the tag whose name matches `name` (e.g. `d`, `h`).
