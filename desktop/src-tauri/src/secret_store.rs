@@ -43,6 +43,12 @@ pub enum KeyringProbe {
 /// as a JSON map under this name within the service.
 const BLOB_KEY: &str = "secrets";
 
+/// Username of the credential listing which keys exist in the Windows per-key
+/// store. Holds key *names* only and never a secret value — see the per-key
+/// section near the bottom of this file for why enumeration has to be explicit.
+#[cfg(all(feature = "system-keyring", target_os = "windows"))]
+const INDEX_KEY: &str = "keyindex";
+
 // ── Interprocess advisory lock ─────────────────────────────────────────────
 //
 // Two concurrent Buzz processes (e.g. the signed DMG build and an unsigned dev
@@ -474,7 +480,29 @@ impl SecretStore {
 
     /// Probe whether `key` exists and whether the backend is reachable.
     pub fn probe(&self, key: &str) -> KeyringProbe {
-        #[cfg(feature = "system-keyring")]
+        #[cfg(all(feature = "system-keyring", target_os = "windows"))]
+        {
+            {
+                let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.as_ref().is_some_and(|m| m.contains_key(key)) {
+                    return KeyringProbe::Present;
+                }
+            }
+            return match self.per_key_read(key) {
+                Ok(Some(_)) => KeyringProbe::Present,
+                // No credential yet: a pre-migration install still has this key
+                // inside the shared blob, and callers gate migration on Present.
+                Ok(None) => match self.load_blob() {
+                    Ok(Some(map)) if map.contains_key(key) => KeyringProbe::Present,
+                    Ok(_) => KeyringProbe::ReachableButEmpty,
+                    // Corrupt or unreadable blob — fail closed, as before.
+                    Err(_) => KeyringProbe::Unreachable,
+                },
+                Err(ref e) if is_keyring_availability_error(e) => KeyringProbe::Unreachable,
+                Err(_) => KeyringProbe::ReachableButEmpty,
+            };
+        }
+        #[cfg(all(feature = "system-keyring", not(target_os = "windows")))]
         {
             match self.load_blob() {
                 Ok(Some(map)) => {
@@ -547,7 +575,35 @@ impl SecretStore {
     /// migration fires when the blob exists but the key is absent, covering
     /// partial-migration scenarios (e.g. identity migrated first, agents not yet).
     pub fn load(&self, key: &str) -> Result<Option<String>, String> {
-        #[cfg(feature = "system-keyring")]
+        #[cfg(all(feature = "system-keyring", target_os = "windows"))]
+        {
+            // Cache first, so a warm process does not re-hit the credential store.
+            {
+                let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(value) = guard.as_ref().and_then(|m| m.get(key)) {
+                    return Ok(Some(value.clone()));
+                }
+            }
+            // The live location: this key's own credential.
+            if let Some(value) = self.per_key_read(key)? {
+                let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key.to_string(), value.clone());
+                return Ok(Some(value));
+            }
+            // Not migrated yet — the shared blob is still authoritative here.
+            //
+            // Deliberately NOT `migrate_legacy_key`: on Windows the per-key
+            // credential IS the live format, and that helper would read it, copy
+            // it into the blob, and delete the credential. See the per-key
+            // section for why that loses keys rather than migrating them.
+            return match self.load_blob()? {
+                Some(map) => Ok(map.get(key).cloned()),
+                None => Ok(None),
+            };
+        }
+        #[cfg(all(feature = "system-keyring", not(target_os = "windows")))]
         {
             match self.load_blob() {
                 Ok(Some(map)) => {
@@ -599,7 +655,18 @@ impl SecretStore {
     /// present in `entries` are left unchanged. If the resulting blob is
     /// identical to what is already stored, no keychain write occurs.
     pub fn store_all(&self, entries: &HashMap<String, String>) -> Result<(), String> {
-        #[cfg(feature = "system-keyring")]
+        #[cfg(all(feature = "system-keyring", target_os = "windows"))]
+        {
+            // No single-blob atomicity to inherit: each key is its own credential,
+            // so this is a loop and a partial failure leaves earlier keys written.
+            // Only caller is the debug-only dev-keyring migration, which retries
+            // wholesale, so partial progress is recoverable rather than harmful.
+            for (k, v) in entries {
+                self.store(k, v)?;
+            }
+            Ok(())
+        }
+        #[cfg(all(feature = "system-keyring", not(target_os = "windows")))]
         {
             self.mutate_blob(|map| {
                 for (k, v) in entries {
@@ -703,7 +770,14 @@ impl SecretStore {
     /// when the entry is absent or holds a different value, and `Err` when the
     /// backend is unavailable.
     pub fn verify_stored_raw(&self, key: &str, expected: &str) -> Result<bool, String> {
-        #[cfg(feature = "system-keyring")]
+        #[cfg(all(feature = "system-keyring", target_os = "windows"))]
+        {
+            // Read the key's own credential. Checking the blob here would report
+            // `false` for every migrated key and make read-back verification
+            // useless on this platform.
+            return Ok(self.per_key_read(key)?.as_deref() == Some(expected));
+        }
+        #[cfg(all(feature = "system-keyring", not(target_os = "windows")))]
         {
             let raw = self.read_blob_raw()?;
             match raw {
@@ -727,7 +801,19 @@ impl SecretStore {
     /// Store `value` for `key`. Reports `Err` on availability failures — callers
     /// decide whether to fall back to file storage.
     pub fn store(&self, key: &str, value: &str) -> Result<(), String> {
-        #[cfg(feature = "system-keyring")]
+        #[cfg(all(feature = "system-keyring", target_os = "windows"))]
+        {
+            // Each secret in its own credential: no shared blob, so no 2560-byte
+            // ceiling and no silent fallback to plaintext at the 9th key.
+            self.per_key_write_verified(key, value)?;
+            self.index_add(key)?;
+            let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .get_or_insert_with(HashMap::new)
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+        #[cfg(all(feature = "system-keyring", not(target_os = "windows")))]
         {
             self.mutate_blob(|map| {
                 map.insert(key.to_string(), value.to_string());
@@ -774,6 +860,21 @@ impl SecretStore {
             let mut all_keys = blob_keys;
             if !all_keys.contains(&"identity".to_string()) {
                 all_keys.push("identity".to_string());
+            }
+
+            // On Windows the per-key credentials ARE the live store, so after a
+            // blob→per-key migration the blob is gone and the loop above would
+            // find nothing to delete — leaving every key behind for the next
+            // launch to re-import, i.e. sign-out that does not sign you out.
+            // The index is the only enumeration available here.
+            #[cfg(target_os = "windows")]
+            {
+                for name in self.index_read().unwrap_or_default() {
+                    if !all_keys.contains(&name) {
+                        all_keys.push(name);
+                    }
+                }
+                all_keys.push(INDEX_KEY.to_string());
             }
 
             // Steps 2 & 3: delete legacy per-key entries for every key.
@@ -899,7 +1000,25 @@ impl SecretStore {
 
     /// Delete the secret for `key`. A missing entry is not an error.
     pub fn delete(&self, key: &str) -> Result<(), String> {
-        #[cfg(feature = "system-keyring")]
+        #[cfg(all(feature = "system-keyring", target_os = "windows"))]
+        {
+            self.per_key_delete(key)?;
+            self.index_remove(key)?;
+            // A pre-migration install may still hold this key inside the blob;
+            // only touch the blob when one actually exists, so a post-migration
+            // delete does not resurrect an empty blob as the cached source.
+            if self.read_blob_raw()?.is_some() {
+                self.mutate_blob(|map| {
+                    map.remove(key);
+                })?;
+            }
+            let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(map) = guard.as_mut() {
+                map.remove(key);
+            }
+            return Ok(());
+        }
+        #[cfg(all(feature = "system-keyring", not(target_os = "windows")))]
         {
             self.mutate_blob(|map| {
                 map.remove(key);
@@ -919,6 +1038,187 @@ impl SecretStore {
             Err("system-keyring feature disabled".to_string())
         }
     }
+}
+
+// ── Windows per-key credential store ──────────────────────────────────────
+//
+// Windows caps a single generic credential at 2560 bytes. Packing every secret
+// into one blob (#1267) therefore hits a hard ceiling at 8 agent keys: the 9th
+// `set_password` fails, `managed_agents::storage::migrate_inline_key` returns
+// `KeptInline`, and the key stays in cleartext in `managed-agents.json`. That
+// ceiling is not a tuning problem — it is exact, and it left 8 of 16 identities
+// on this platform permanently in plaintext.
+//
+// The blob exists to suppress *macOS* keychain ACL prompts, which Windows does
+// not have. So on Windows each secret gets its own credential and the ceiling
+// disappears; macOS and Linux keep the blob untouched.
+//
+// **The naming deliberately matches the pre-#1264 per-key format**
+// (`Entry::new(service, key)`), which is why `load()` must NOT run
+// `migrate_legacy_key` on Windows: that helper reads a per-key entry, writes it
+// *into the blob*, and then deletes the per-key entry. Left enabled, it would
+// pull every key back into the full blob (where most writes then fail on the
+// cap) and delete the credential that had just been written — silent key loss
+// on any record whose inline copy had already been stripped. The legacy reader
+// and the live writer would be fighting over the same credential names.
+#[cfg(all(feature = "system-keyring", target_os = "windows"))]
+impl SecretStore {
+    /// Read one secret straight from its own credential, bypassing the cache.
+    fn per_key_read(&self, key: &str) -> Result<Option<String>, String> {
+        let entry = keyring_entry(&self.service, key).map_err(|e| format!("keyring entry: {e}"))?;
+        match entry.get_password() {
+            Ok(v) => Ok(Some(v)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) if is_keyring_availability_error(&e.to_string()) => {
+                Err(format!("keyring unavailable: {e}"))
+            }
+            Err(e) => Err(format!("keyring read {key}: {e}")),
+        }
+    }
+
+    /// Write one secret to its own credential and prove the round-trip.
+    ///
+    /// Verify-on-write is not belt-and-braces here: it is the property the
+    /// blob→per-key migration depends on to decide whether dropping the blob is
+    /// safe, and the blob is the only copy of the keys it holds.
+    fn per_key_write_verified(&self, key: &str, value: &str) -> Result<(), String> {
+        let entry = keyring_entry(&self.service, key).map_err(|e| format!("keyring entry: {e}"))?;
+        entry
+            .set_password(value)
+            .map_err(|e| format!("keyring write {key}: {e}"))?;
+        match self.per_key_read(key)? {
+            Some(ref stored) if stored == value => Ok(()),
+            Some(_) => Err(format!("keyring read-back mismatch for {key}")),
+            None => Err(format!("keyring read-back absent for {key}")),
+        }
+    }
+
+    /// Remove one secret's credential. A missing entry is success.
+    fn per_key_delete(&self, key: &str) -> Result<(), String> {
+        let entry = keyring_entry(&self.service, key).map_err(|e| format!("keyring entry: {e}"))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) if is_keyring_availability_error(&e.to_string()) => {
+                Err(format!("keyring unavailable deleting {key}: {e}"))
+            }
+            Err(e) => Err(format!("keyring delete {key}: {e}")),
+        }
+    }
+
+    /// Names currently held in the per-key store.
+    ///
+    /// Windows offers no credential enumeration through the `keyring` crate, and
+    /// sign-out (`delete_all_with_legacy_cleanup`) must be able to wipe every
+    /// key or a stale credential resurrects a deleted identity on next launch.
+    /// So the names are tracked explicitly. This credential holds **names only,
+    /// never a secret value**, which is what keeps it clear of the 2560-byte cap
+    /// that forced this whole design: 16 pubkey-shaped names is ~1.2 KB.
+    fn index_read(&self) -> Result<Vec<String>, String> {
+        match self.per_key_read(INDEX_KEY)? {
+            None => Ok(Vec::new()),
+            Some(json) => serde_json::from_str::<Vec<String>>(&json)
+                .map_err(|e| format!("key index json: {e}")),
+        }
+    }
+
+    fn index_write(&self, names: &[String]) -> Result<(), String> {
+        let mut sorted: Vec<String> = names.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let json = serde_json::to_string(&sorted).map_err(|e| format!("key index encode: {e}"))?;
+        self.per_key_write_verified(INDEX_KEY, &json)
+    }
+
+    fn index_add(&self, key: &str) -> Result<(), String> {
+        if key == INDEX_KEY {
+            return Ok(());
+        }
+        let mut names = self.index_read()?;
+        if names.iter().any(|n| n == key) {
+            return Ok(());
+        }
+        names.push(key.to_string());
+        self.index_write(&names)
+    }
+
+    fn index_remove(&self, key: &str) -> Result<(), String> {
+        let mut names = self.index_read()?;
+        let before = names.len();
+        names.retain(|n| n != key);
+        if names.len() == before {
+            return Ok(());
+        }
+        self.index_write(&names)
+    }
+
+    /// Move every secret out of the shared blob into its own credential.
+    ///
+    /// **Ordering is the safety property, not a preference.** The keys held only
+    /// in the blob have no copy anywhere else — not in `managed-agents.json`, not
+    /// on disk. So every key is written *and read back* first, and the blob is
+    /// deleted only once all of them have verified. Any failure returns `Err`
+    /// with the blob still intact, which leaves the system exactly as it was
+    /// rather than partially migrated.
+    ///
+    /// Idempotent: with no blob present there is nothing to move, which is also
+    /// the post-migration steady state.
+    pub fn migrate_blob_to_per_key(&self) -> Result<PerKeyMigrationReport, String> {
+        let _lock = acquire_blob_lock(&self.service)?;
+
+        let raw = self.read_blob_raw()?;
+        let Some(bytes) = raw else {
+            return Ok(PerKeyMigrationReport {
+                migrated: 0,
+                blob_removed: false,
+            });
+        };
+        let json = String::from_utf8(bytes).map_err(|e| format!("blob utf8: {e}"))?;
+        let map: HashMap<String, String> =
+            serde_json::from_str(&json).map_err(|e| format!("blob json: {e}"))?;
+
+        // Phase 1 — write and verify all of them. Nothing is destroyed here, so
+        // an early return costs only the duplicate credentials, which the next
+        // attempt overwrites.
+        let mut names: Vec<String> = Vec::with_capacity(map.len());
+        for (key, value) in &map {
+            self.per_key_write_verified(key, value)?;
+            names.push(key.clone());
+        }
+
+        // Phase 2 — record what exists, so sign-out can find it later.
+        let mut all = self.index_read()?;
+        all.extend(names.iter().cloned());
+        self.index_write(&all)?;
+
+        // Phase 3 — only now is dropping the blob safe.
+        let entry = keyring_entry(&self.service, BLOB_KEY)
+            .map_err(|e| format!("keyring entry constructor blob: {e}"))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) if is_keyring_availability_error(&e.to_string()) => {
+                return Err(format!("keyring unavailable deleting blob: {e}"));
+            }
+            Err(e) => return Err(format!("keyring blob delete: {e}")),
+        }
+
+        // The cache held the blob map; it is no longer the source of truth.
+        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+
+        Ok(PerKeyMigrationReport {
+            migrated: map.len(),
+            blob_removed: true,
+        })
+    }
+}
+
+/// Outcome of [`SecretStore::migrate_blob_to_per_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerKeyMigrationReport {
+    /// Secrets written into their own credential and read back successfully.
+    pub migrated: usize,
+    /// Whether the shared blob was dropped. False means there was none to drop.
+    pub blob_removed: bool,
 }
 
 #[cfg(all(test, feature = "system-keyring"))]
@@ -955,6 +1255,180 @@ mod tests {
         assert_eq!(
             store.load("identity").unwrap(),
             Some("nsec1test".to_string())
+        );
+    }
+
+    // ── Windows per-key store (require real OS credential store) ───────────
+    //
+    // These use their own throwaway service names. They must NEVER run against
+    // "buzz-desktop": that is the live store holding real agent identities.
+
+    /// The regression test for the hazard that makes this change delicate.
+    ///
+    /// `migrate_legacy_key_keyring` reads a per-key credential, copies it INTO
+    /// the blob, and deletes the credential. On Windows the per-key credential is
+    /// now the live format, so if `load()` still routed through that helper it
+    /// would destroy the key it had just been asked to read — and on any record
+    /// whose inline JSON copy had already been stripped, that is silent key loss.
+    ///
+    /// Asserts the opposite: reading leaves the credential in place and creates
+    /// no blob.
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires real OS credential store (run with --ignored)"]
+    #[test]
+    fn load_does_not_pull_per_key_into_blob_or_delete_it() {
+        let svc = "buzz-test-perkey-no-legacy-migration";
+        let store = SecretStore::keyring(svc);
+        let _ = store.delete("agent:aaa");
+        let _ = store.per_key_delete(BLOB_KEY);
+        let _ = store.per_key_delete(INDEX_KEY);
+
+        store.store("agent:aaa", "nsec1value").unwrap();
+
+        // Read twice, through a cold cache each time, so the legacy path would
+        // have had every chance to fire.
+        for _ in 0..2 {
+            let reader = SecretStore::keyring(svc);
+            assert_eq!(
+                reader.load("agent:aaa").unwrap(),
+                Some("nsec1value".to_string()),
+                "the key must still be readable after a load"
+            );
+        }
+
+        let checker = SecretStore::keyring(svc);
+        assert_eq!(
+            checker.per_key_read("agent:aaa").unwrap(),
+            Some("nsec1value".to_string()),
+            "load() must NOT delete the per-key credential"
+        );
+        assert!(
+            checker.read_blob_raw().unwrap().is_none(),
+            "load() must NOT create a blob on Windows — that is the ceiling this change removes"
+        );
+
+        let _ = checker.delete("agent:aaa");
+        let _ = checker.per_key_delete(INDEX_KEY);
+    }
+
+    /// A 9th key must succeed. Under the blob this is the exact write that failed
+    /// and pushed a key into plaintext.
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires real OS credential store (run with --ignored)"]
+    #[test]
+    fn per_key_store_has_no_eight_key_ceiling() {
+        let svc = "buzz-test-perkey-no-ceiling";
+        let store = SecretStore::keyring(svc);
+        let names: Vec<String> = (0..12).map(|i| format!("agent:k{i:02}")).collect();
+        for n in &names {
+            let _ = store.delete(n);
+        }
+        let _ = store.per_key_delete(INDEX_KEY);
+
+        for (i, n) in names.iter().enumerate() {
+            store
+                .store(n, &format!("nsec1value{i:02}"))
+                .unwrap_or_else(|e| panic!("storing key {i} failed: {e}"));
+        }
+
+        let reader = SecretStore::keyring(svc);
+        for (i, n) in names.iter().enumerate() {
+            assert_eq!(
+                reader.per_key_read(n).unwrap(),
+                Some(format!("nsec1value{i:02}")),
+                "key {i} must be readable"
+            );
+        }
+        assert_eq!(
+            reader.index_read().unwrap().len(),
+            names.len(),
+            "index must list every stored key so sign-out can wipe them"
+        );
+
+        for n in &names {
+            let _ = reader.delete(n);
+        }
+        let _ = reader.per_key_delete(INDEX_KEY);
+    }
+
+    /// Migration moves every blob entry into its own credential, records them in
+    /// the index, and only then drops the blob.
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires real OS credential store (run with --ignored)"]
+    #[test]
+    fn migrate_blob_to_per_key_moves_all_then_drops_blob() {
+        let svc = "buzz-test-perkey-migration";
+        let seed = SecretStore::keyring(svc);
+        let _ = seed.per_key_delete(INDEX_KEY);
+        for k in ["identity", "agent:one", "agent:two"] {
+            let _ = seed.per_key_delete(k);
+        }
+
+        // Seed a pre-migration blob directly, the way the old format wrote it.
+        let mut map = HashMap::new();
+        map.insert("identity".to_string(), "nsec1identity".to_string());
+        map.insert("agent:one".to_string(), "nsec1one".to_string());
+        map.insert("agent:two".to_string(), "nsec1two".to_string());
+        keyring_entry(svc, BLOB_KEY)
+            .unwrap()
+            .set_password(&serde_json::to_string(&map).unwrap())
+            .unwrap();
+
+        let store = SecretStore::keyring(svc);
+        let report = store.migrate_blob_to_per_key().unwrap();
+        assert_eq!(report.migrated, 3);
+        assert!(report.blob_removed);
+
+        let reader = SecretStore::keyring(svc);
+        // The identity key travels too — it lives in the same blob, and missing it
+        // would break the human's own login, not just agents.
+        assert_eq!(
+            reader.per_key_read("identity").unwrap(),
+            Some("nsec1identity".to_string())
+        );
+        assert_eq!(
+            reader.per_key_read("agent:one").unwrap(),
+            Some("nsec1one".to_string())
+        );
+        assert!(
+            reader.read_blob_raw().unwrap().is_none(),
+            "blob must be gone once every key verified"
+        );
+        let mut idx = reader.index_read().unwrap();
+        idx.sort();
+        assert_eq!(idx, vec!["agent:one", "agent:two", "identity"]);
+
+        // Idempotent: nothing left to move.
+        let again = reader.migrate_blob_to_per_key().unwrap();
+        assert_eq!(again.migrated, 0);
+        assert!(!again.blob_removed);
+
+        for k in ["identity", "agent:one", "agent:two"] {
+            let _ = reader.delete(k);
+        }
+        let _ = reader.per_key_delete(INDEX_KEY);
+    }
+
+    /// Sign-out must remove the per-key credentials, not just the (now absent)
+    /// blob — otherwise the next launch re-imports a deleted identity.
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires real OS credential store (run with --ignored)"]
+    #[test]
+    fn sign_out_wipes_per_key_credentials_and_index() {
+        let svc = "buzz-test-perkey-signout";
+        let store = SecretStore::keyring(svc);
+        store.store("identity", "nsec1identity").unwrap();
+        store.store("agent:one", "nsec1one").unwrap();
+
+        store.delete_all_with_legacy_cleanup().unwrap();
+
+        let reader = SecretStore::keyring(svc);
+        assert_eq!(reader.per_key_read("identity").unwrap(), None);
+        assert_eq!(reader.per_key_read("agent:one").unwrap(), None);
+        assert_eq!(
+            reader.per_key_read(INDEX_KEY).unwrap(),
+            None,
+            "the index itself must not survive sign-out"
         );
     }
 
@@ -1233,6 +1707,13 @@ mod tests {
         let _ = store.delete("keep");
     }
 
+    /// Legacy per-key → blob absorption. Not Windows: there the per-key entry is
+    /// the LIVE format, so "absorb into the blob and delete the entry" is the
+    /// data-loss bug this change removes, not the behaviour to preserve. The
+    /// Windows contract is asserted by the opposite test,
+    /// [`load_does_not_pull_per_key_into_blob_or_delete_it`]. Both are correct
+    /// for their platform; keeping this one enabled on Windows would pin the bug.
+    #[cfg(not(target_os = "windows"))]
     #[ignore = "requires real OS keychain (run locally)"]
     #[test]
     fn blob_migration_from_per_key_entry() {
