@@ -203,6 +203,51 @@ pub async fn create_channel_with_id(
 
     let mut tx = pool.begin().await?;
 
+    // Guard against duplicate channel names created moments apart under different
+    // client-generated UUIDs (the `ON CONFLICT (community_id, id)` below only
+    // catches literal event replay of the *same* id, not two independent create
+    // calls for a channel that logically already exists). Scoped to stream/forum —
+    // the two types reachable via `buzz channels create` — because DM channels
+    // intentionally share the display name "DM"/"Group DM (N)" across every
+    // conversation, and workflow channels are provisioned outside this path.
+    if matches!(channel_type, ChannelType::Stream | ChannelType::Forum) {
+        let existing_id: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM channels
+            WHERE community_id = $1 AND name = $2 AND channel_type = $3::channel_type
+              AND deleted_at IS NULL
+            "#,
+        )
+        .bind(community_id.as_uuid())
+        .bind(name)
+        .bind(channel_type.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(existing_id) = existing_id {
+            let row = sqlx::query(
+                r#"
+                SELECT id, name, channel_type::text AS channel_type, visibility::text AS visibility,
+                       description, canvas,
+                       created_by, created_at, updated_at, archived_at, deleted_at,
+                       nip29_group_id, topic_required, max_members,
+                       topic, topic_set_by, topic_set_at,
+                       purpose, purpose_set_by, purpose_set_at,
+                       ttl_seconds, ttl_deadline
+                FROM channels WHERE community_id = $1 AND id = $2
+                "#,
+            )
+            .bind(community_id.as_uuid())
+            .bind(existing_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            let record = row_to_channel_record(row)?;
+            tx.commit().await?;
+            return Ok((record, false));
+        }
+    }
+
     let rows_affected = sqlx::query(
         r#"
         INSERT INTO channels (id, community_id, name, channel_type, visibility, description, created_by, ttl_seconds, ttl_deadline)
@@ -2086,6 +2131,107 @@ mod tests {
         assert!(!listed_a
             .iter()
             .any(|row| row.id == channel_id && row.name == "community-b-channel"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn create_channel_with_id_rejects_duplicate_name_within_community() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let creator = random_pubkey();
+
+        let (first, first_created) = create_channel_with_id(
+            &pool,
+            community,
+            Uuid::new_v4(),
+            "duplicate-name-guard",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &creator,
+            None,
+        )
+        .await
+        .expect("first create should succeed");
+        assert!(first_created);
+
+        let (second, second_created) = create_channel_with_id(
+            &pool,
+            community,
+            Uuid::new_v4(),
+            "duplicate-name-guard",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &creator,
+            None,
+        )
+        .await
+        .expect("second create should not error, just decline");
+
+        assert!(
+            !second_created,
+            "a second channel with the same name should not be created"
+        );
+        assert_eq!(
+            second.id, first.id,
+            "the declined create should surface the existing channel, not a new one"
+        );
+
+        let listed = list_channels(&pool, community, None)
+            .await
+            .expect("list channels");
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|c| c.name == "duplicate-name-guard")
+                .count(),
+            1,
+            "only one channel with this name should exist"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn create_channel_with_id_allows_same_name_across_different_types() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let creator = random_pubkey();
+
+        let (stream, stream_created) = create_channel_with_id(
+            &pool,
+            community,
+            Uuid::new_v4(),
+            "shared-name",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &creator,
+            None,
+        )
+        .await
+        .expect("stream create should succeed");
+        assert!(stream_created);
+
+        let (forum, forum_created) = create_channel_with_id(
+            &pool,
+            community,
+            Uuid::new_v4(),
+            "shared-name",
+            ChannelType::Forum,
+            ChannelVisibility::Open,
+            None,
+            &creator,
+            None,
+        )
+        .await
+        .expect("forum create should succeed");
+
+        assert!(
+            forum_created,
+            "a forum channel should not be blocked by a stream channel with the same name"
+        );
+        assert_ne!(stream.id, forum.id);
     }
 
     /// Agent owner (non-admin) can remove their own bot from a channel.
