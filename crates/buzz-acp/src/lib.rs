@@ -11,6 +11,7 @@ mod queue;
 mod relay;
 mod setup_mode;
 mod usage;
+mod watermark;
 
 pub use usage::TurnUsage;
 
