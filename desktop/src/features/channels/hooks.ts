@@ -54,6 +54,7 @@ import {
   channelMembersQueryKey,
 } from "@/features/channels/rosterFreshness";
 import { dmVisibilityQueryKeyFor } from "@/features/channels/useHiddenDmIds";
+import { recordSidebarDiagnostic } from "@/features/channels/sidebarDiagnosticLog";
 
 export const channelsQueryKey = ["channels"] as const;
 /** Keeps focused polling at the established one-minute cadence. */
@@ -392,6 +393,17 @@ export async function refreshChannelsQuery({
     if (relayUrl && ownerPubkey) {
       persistSnapshot(relayUrl, ownerPubkey, pair.channels, pair.hash);
     }
+    recordSidebarDiagnostic({
+      ts: Date.now(),
+      branch: "full-fetch",
+      knownHash,
+      payloadHash: full.hash,
+      payloadChannelsWasNull: payload.channels === null,
+      hasMatchingNotModifiedResponse,
+      cachedPairCount: cachedPair?.channels.length ?? null,
+      resultCount: sorted.length,
+      resultChannelIds: sorted.map((c) => c.id),
+    });
     return sorted;
   }
 
@@ -427,6 +439,17 @@ export async function refreshChannelsQuery({
   if (relayUrl && ownerPubkey) {
     persistSnapshot(relayUrl, ownerPubkey, pair.channels, pair.hash);
   }
+  recordSidebarDiagnostic({
+    ts: Date.now(),
+    branch: payload.channels === null ? "not-modified" : "direct-full-fetch",
+    knownHash,
+    payloadHash: payload.hash,
+    payloadChannelsWasNull: payload.channels === null,
+    hasMatchingNotModifiedResponse,
+    cachedPairCount: cachedPair?.channels.length ?? null,
+    resultCount: sorted.length,
+    resultChannelIds: sorted.map((c) => c.id),
+  });
   return sorted;
 }
 
