@@ -311,6 +311,49 @@ async fn fetch_member_pubkeys(
     Some(parse_member_pubkeys(events.first()?))
 }
 
+/// Extract the channel type (the `t` tag value, e.g. "stream" or "forum")
+/// from a single kind:39000 channel-metadata event.
+fn parse_channel_type(event: &serde_json::Value) -> Option<String> {
+    let tags = event.get("tags")?.as_array()?;
+    for tag in tags {
+        let Some(arr) = tag.as_array() else {
+            continue;
+        };
+        let key = arr.first().and_then(|v| v.as_str()).unwrap_or("");
+        if key == "t" {
+            return arr.get(1).and_then(|v| v.as_str()).map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Look up a channel's type via its kind:39000 metadata event. Returns
+/// `None` when the channel can't be resolved (deleted, relay error, etc.) —
+/// callers fall back to the pre-existing kind:9 default in that case.
+async fn fetch_channel_type(client: &BuzzClient, channel_id: &str) -> Option<String> {
+    let filter = serde_json::json!({
+        "kinds": [39000],
+        "#d": [channel_id],
+        "limit": 1,
+    });
+    let events = fetch_events(client, &filter).await?;
+    parse_channel_type(events.first()?)
+}
+
+/// The event kind a `send` with no explicit `--kind` should use, based on the
+/// target channel's type. Forum channels are queried by Desktop via kind
+/// 45001 (top-level post) / 45003 (thread comment) — defaulting a forum send
+/// to kind 9 silently published a message the forum view could never see.
+/// Every other channel type keeps the pre-existing kind:9 default so callers
+/// that never pass `--kind` (chase-loop, existing scripts, etc.) are unaffected.
+fn default_kind_for_channel(channel_type: Option<&str>, has_reply_to: bool) -> u16 {
+    match channel_type {
+        Some("forum") if has_reply_to => 45003,
+        Some("forum") => 45001,
+        _ => 9,
+    }
+}
+
 /// Parse member pubkeys from a kind 39002 event JSON value.
 ///
 /// Filters and canonicalizes via `nostr::PublicKey::from_hex` — matching
@@ -680,12 +723,23 @@ pub async fn cmd_send_message(
 
     let mention_refs: Vec<&str> = mention_pubkeys.iter().map(String::as_str).collect();
 
-    let builder = match p.kind {
-        Some(45001) => {
+    // No explicit --kind: infer it from the channel type rather than always
+    // defaulting to kind 9, so a forum channel doesn't silently get a message
+    // its own forum view can never see (kind 9 isn't in that query's kinds).
+    let effective_kind = match p.kind {
+        Some(k) => k,
+        None => {
+            let channel_type = fetch_channel_type(client, &p.channel_id).await;
+            default_kind_for_channel(channel_type.as_deref(), p.reply_to.is_some())
+        }
+    };
+
+    let builder = match effective_kind {
+        45001 => {
             buzz_sdk::build_forum_post(channel_uuid, &final_content, &mention_refs, &media_tags)
                 .map_err(|e| CliError::Other(format!("build_forum_post failed: {e}")))?
         }
-        Some(45003) => {
+        45003 => {
             let tr = thread_ref.as_ref().ok_or_else(|| {
                 CliError::Usage("--reply-to is required for forum comments (kind 45003)".into())
             })?;
@@ -698,7 +752,7 @@ pub async fn cmd_send_message(
             )
             .map_err(|e| CliError::Other(format!("build_forum_comment failed: {e}")))?
         }
-        None | Some(9) => buzz_sdk::build_message(
+        9 => buzz_sdk::build_message(
             channel_uuid,
             &final_content,
             thread_ref.as_ref(),
@@ -707,7 +761,7 @@ pub async fn cmd_send_message(
             &media_tags,
         )
         .map_err(|e| CliError::Other(format!("build_message failed: {e}")))?,
-        Some(k) => {
+        k => {
             return Err(CliError::Usage(format!(
                 "--kind {k} is not supported (use 9, 45001, or 45003)"
             )))
@@ -1056,11 +1110,11 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        channel_id_from_event, cmd_get_thread, event_mention_pubkeys, find_root_from_tags,
-        match_profiles_by_name, merge_message_mentions, missing_members,
-        normalize_explicit_mentions, parse_member_pubkeys, resolve_names_to_pubkeys,
-        resolve_thread_target, thread_ref_from_event, thread_ref_from_parent_tags, BuzzClient,
-        CliError, Uuid,
+        channel_id_from_event, cmd_get_thread, default_kind_for_channel, event_mention_pubkeys,
+        find_root_from_tags, match_profiles_by_name, merge_message_mentions, missing_members,
+        normalize_explicit_mentions, parse_channel_type, parse_member_pubkeys,
+        resolve_names_to_pubkeys, resolve_thread_target, thread_ref_from_event,
+        thread_ref_from_parent_tags, BuzzClient, CliError, Uuid,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
@@ -1392,6 +1446,42 @@ mod tests {
             ],
         });
         assert_eq!(parse_member_pubkeys(&event), vec![PK_VALID_A, PK_VALID_A]);
+    }
+
+    #[test]
+    fn parse_channel_type_reads_t_tag() {
+        let event = json!({
+            "tags": [
+                ["d", "channel-id"],
+                ["name", "General"],
+                ["t", "forum"],
+            ],
+        });
+        assert_eq!(parse_channel_type(&event).as_deref(), Some("forum"));
+    }
+
+    #[test]
+    fn parse_channel_type_handles_malformed_or_missing_tag() {
+        assert_eq!(parse_channel_type(&json!({})), None);
+        assert_eq!(parse_channel_type(&json!({"tags": "not an array"})), None);
+        assert_eq!(
+            parse_channel_type(&json!({"tags": [["d", "channel-id"]]})),
+            None
+        );
+    }
+
+    #[test]
+    fn default_kind_for_channel_picks_forum_kinds() {
+        assert_eq!(default_kind_for_channel(Some("forum"), false), 45001);
+        assert_eq!(default_kind_for_channel(Some("forum"), true), 45003);
+    }
+
+    #[test]
+    fn default_kind_for_channel_keeps_kind_9_for_non_forum_or_unknown() {
+        assert_eq!(default_kind_for_channel(Some("stream"), false), 9);
+        assert_eq!(default_kind_for_channel(Some("stream"), true), 9);
+        assert_eq!(default_kind_for_channel(None, false), 9);
+        assert_eq!(default_kind_for_channel(None, true), 9);
     }
 
     #[test]
