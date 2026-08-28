@@ -2,9 +2,11 @@ import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import {
+  useChannelsQuery,
   useOpenDmMutation,
   useUpsertCachedChannel,
 } from "@/features/channels/hooks";
+import { findExistingDirectMessage } from "@/features/channels/lib/findExistingDirectMessage";
 import type { Channel } from "@/shared/api/types";
 import { useSendMessageMutation } from "@/features/messages/hooks";
 import { getKeyboardSearchSelection } from "@/features/profile/lib/userCandidateSearch";
@@ -73,6 +75,31 @@ export function NewMessageScreen() {
   const visibleSearchResults =
     isSearchTransitionPending || isDirectoryLoading ? [] : searchResults;
   const showRecipientPicker = isRecipientPickerOpen && !isPending;
+
+  const channelsQuery = useChannelsQuery();
+  const existingDirectMessageChannel = React.useMemo(
+    () =>
+      findExistingDirectMessage(
+        channelsQuery.data ?? [],
+        selectedUsers.map((user) => user.pubkey),
+        currentPubkey,
+      ),
+    [channelsQuery.data, currentPubkey, selectedUsers],
+  );
+
+  // Selecting an already-added contact used to leave this blank compose
+  // screen showing forever ("doesn't come up until I send"), because history
+  // only renders on the real channel route (see sendFirstMessage below). Once
+  // the recipient picker closes on a selection that already has a DM, resume
+  // that conversation directly instead of making the user send a message
+  // first just to see it.
+  React.useEffect(() => {
+    if (isRecipientPickerOpen || isPending || !existingDirectMessageChannel) {
+      return;
+    }
+    preparedDirectMessageRef.current = existingDirectMessageChannel;
+    void goChannel(existingDirectMessageChannel.id, { replace: true });
+  }, [existingDirectMessageChannel, goChannel, isPending, isRecipientPickerOpen]);
   const highlightedRecipientIndex = React.useMemo(() => {
     if (!showRecipientPicker || visibleSearchResults.length === 0) {
       return -1;

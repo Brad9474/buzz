@@ -35,6 +35,16 @@ export function resolveChannelDisplayLabel(
           participant.pubkey.toLowerCase() !== currentPubkey.toLowerCase(),
       )
     : participants;
+
+  // A DM channel's cached participantPubkeys is briefly incomplete right
+  // after openDm/upsertCachedChannel — the peer hasn't landed yet — so
+  // otherParticipants comes up empty even though this isn't really a
+  // self-DM. memberCount is the server-authoritative participant count; a
+  // mismatch means the cache is still catching up. Don't mislabel it "You".
+  if (otherParticipants.length === 0 && channel.memberCount > participants.length) {
+    return channel.name;
+  }
+
   const resolvedLabels = (
     otherParticipants.length > 0 ? otherParticipants : participants
   ).map((participant) =>

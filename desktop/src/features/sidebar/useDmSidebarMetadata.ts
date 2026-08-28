@@ -4,6 +4,7 @@ import { usePresenceQuery } from "@/features/presence/hooks";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { resolveChannelDisplayLabel } from "@/features/sidebar/lib/channelLabels";
+import { resolveVisibleDmParticipants } from "@/features/sidebar/lib/dmParticipantVisibility";
 import type { SidebarDmParticipant } from "@/features/sidebar/ui/SidebarSection";
 import type { Channel, PresenceStatus } from "@/shared/api/types";
 
@@ -98,25 +99,11 @@ export function useDmSidebarMetadata({
     () =>
       Object.fromEntries(
         directMessages.map((channel) => {
-          const participants = channel.participantPubkeys.map(
-            (pubkey, index) => ({
-              fallbackName: channel.participants[index] ?? null,
-              pubkey,
-            }),
+          const visibleParticipants = resolveVisibleDmParticipants(
+            channel,
+            currentPubkey,
+            selfDmLabels,
           );
-          const otherParticipants = participants.filter((participant) => {
-            if (
-              participant.pubkey.toLowerCase() === currentPubkey?.toLowerCase()
-            ) {
-              return false;
-            }
-
-            const participantLabel =
-              participant.fallbackName?.trim().toLowerCase() ?? null;
-            return !participantLabel || !selfDmLabels.has(participantLabel);
-          });
-          const visibleParticipants =
-            otherParticipants.length > 0 ? otherParticipants : participants;
 
           return [
             channel.id,
