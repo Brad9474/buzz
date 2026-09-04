@@ -5,7 +5,6 @@ import {
   useRelayAgentsQuery,
   useTeamsQuery,
 } from "@/features/agents/hooks";
-import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOwnerOnly";
 import {
   useChannelMembersQuery,
   useChannelsQuery,
@@ -40,6 +39,7 @@ import type {
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { channelMemberPubkeySet } from "@/shared/lib/rosterDerivations";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
 import { flushMentionDebounce } from "./flushMentionDebounce";
 import { useAgentMentionRevalidation } from "./agentMentionRevalidation";
@@ -101,7 +101,6 @@ export function useMentions(
   const channelsQuery = useChannelsQuery();
   const personasQuery = usePersonasQuery();
   const teamsQuery = useTeamsQuery();
-  const agentAccessOwnerOnlyQuery = useAgentAccessOwnerOnlyQuery();
   const managedAgentDirectoryReady =
     managedAgentsQuery.data !== undefined &&
     managedAgentsQuery.error === null &&
@@ -110,12 +109,8 @@ export function useMentions(
     relayAgentsQuery.data !== undefined &&
     relayAgentsQuery.error === null &&
     !relayAgentsQuery.isFetching;
-  const ownerPolicyReady =
-    agentAccessOwnerOnlyQuery.data !== undefined &&
-    agentAccessOwnerOnlyQuery.error === null &&
-    !agentAccessOwnerOnlyQuery.isFetching;
   const agentDirectoriesReady =
-    managedAgentDirectoryReady && relayAgentDirectoryReady && ownerPolicyReady;
+    managedAgentDirectoryReady && relayAgentDirectoryReady;
   const canSearchGlobalUsers = canSearchGlobalPeople && agentDirectoriesReady;
   const userSearchQuery = useInfiniteUserSearchQuery(mentionQuery ?? "", {
     allowEmpty: true,
@@ -231,9 +226,10 @@ export function useMentions(
     () => new Set(activePersonas.map((persona) => persona.id)),
     [activePersonas],
   );
+  // Identity-cached (shared with the timeline's roster derivations) — the
+  // Set is built once per distinct roster instead of per consumer.
   const memberPubkeys = React.useMemo(
-    () =>
-      new Set((members ?? []).map((member) => normalizePubkey(member.pubkey))),
+    () => (members ? channelMemberPubkeySet(members) : new Set<string>()),
     [members],
   );
   const agentIdentityPubkeys = React.useMemo(
@@ -256,16 +252,12 @@ export function useMentions(
       if (
         shouldHideAgentFromMentions({
           isAgent: candidate.isAgent === true,
-          isManagedAgent: candidate.isManagedAgent === true,
           pubkey,
-          ownerPubkey: candidate.ownerPubkey,
-          currentPubkey,
           mentionableAgentPubkeys,
           directoryReady:
             candidate.isManagedAgent === true
               ? managedAgentDirectoryReady
               : relayAgentDirectoryReady,
-          ownerOnly: agentAccessOwnerOnlyQuery.data,
         })
       ) {
         return;
@@ -349,7 +341,7 @@ export function useMentions(
         personaId:
           managedAgentPersonaIdsByPubkey.get(pubkey) ??
           (activePersonaById.has(pubkey) ? pubkey : undefined),
-        ownerPubkey: null,
+        ownerPubkey: agent.ownerPubkey,
         isAgent: true,
       });
     }
@@ -416,7 +408,6 @@ export function useMentions(
   }, [
     activePersonaById,
     activePersonas,
-    agentAccessOwnerOnlyQuery.data,
     userSearchResults,
     canSearchGlobalUsers,
     currentPubkey,
@@ -515,13 +506,14 @@ export function useMentions(
     searchableNamesLowerRef.current = searchableNamesLower;
   }, [searchableNamesLower]);
 
-  React.useEffect(() => {
-    return () => {
+  React.useEffect(
+    () => () => {
       if (debounceTimerRef.current !== null) {
         clearTimeout(debounceTimerRef.current);
       }
-    };
-  }, []);
+    },
+    [],
+  );
 
   const matchingSuggestions = React.useMemo<MentionSuggestion[]>(() => {
     if (mentionQuery === null) {
@@ -536,6 +528,7 @@ export function useMentions(
       .slice(0, MENTION_SUGGESTION_LIMIT)
       .map(({ candidate, label }) =>
         mapMentionCandidateToSuggestion({
+          agentProvenanceReady: agentDirectoriesReady,
           candidate,
           label,
           channelType: options?.channelType,
@@ -546,6 +539,7 @@ export function useMentions(
       );
   }, [
     activePersonaIds,
+    agentDirectoriesReady,
     currentPubkey,
     mentionCandidatesWithTeams,
     mentionQuery,
@@ -824,10 +818,7 @@ export function useMentions(
       ? { type: "channel", channelId: mentionChannelId }
       : { type: "managed-only" },
     sharedChannelIds,
-    ownerOnly: agentAccessOwnerOnlyQuery.data,
-    ownerPolicyError: agentAccessOwnerOnlyQuery.error,
     refetchManagedAgents: managedAgentsQuery.refetch,
-    refetchRelayAgents: relayAgentsQuery.refetch,
   });
 
   const extractMentionPersonas = React.useCallback(
@@ -926,6 +917,7 @@ export function useMentions(
             searchableNamesLowerRef,
             candidates: mentionCandidatesWithTeams,
             activePersonaIds,
+            agentProvenanceReady: agentDirectoriesReady,
             channelType: options?.channelType,
             currentPubkey,
             ownerProfiles: ownerProfilesQuery.data?.profiles,
@@ -955,6 +947,7 @@ export function useMentions(
     },
     [
       activePersonaIds,
+      agentDirectoriesReady,
       cancelMentionAutocomplete,
       currentPubkey,
       isMentionOpen,

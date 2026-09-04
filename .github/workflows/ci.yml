@@ -31,6 +31,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 2
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
@@ -46,23 +47,21 @@ jobs:
               - 'deny.toml'
               - '.github/workflows/ci.yml'
               - 'scripts/run-tests.sh'
+              - 'scripts/model-capabilities.json'
+              - 'scripts/normative-corpus.json'
               - 'justfile'
             desktop:
-              - 'scripts/check-file-sizes-core.mjs'
-              - 'scripts/check-file-sizes-core.test.mjs'
+              - 'scripts/model-capabilities.json'
+              - 'scripts/normative-corpus.json'
               - 'desktop/**'
               - '!desktop/src-tauri/**'
               - 'pnpm-lock.yaml'
             desktop-rust:
               - 'desktop/src-tauri/**'
             web:
-              - 'scripts/check-file-sizes-core.mjs'
-              - 'scripts/check-file-sizes-core.test.mjs'
               - 'web/**'
               - 'pnpm-lock.yaml'
             mobile:
-              - 'scripts/check-file-sizes-core.mjs'
-              - 'scripts/check-file-sizes-core.test.mjs'
               - 'mobile/**'
               - 'scripts/mobile-release.sh'
               - 'scripts/mobile-worktree-overrides.sh'
@@ -88,8 +87,8 @@ jobs:
           scripts/test-mobile-release-candidate-publisher.sh
       - name: Mobile worktree identity contract
         run: scripts/test-mobile-worktree-overrides.sh
-      - name: File size ratchet unit tests
-        run: node --test scripts/check-file-sizes-core.test.mjs
+      - name: File size policy
+        run: just file-size-check
 
   rust-lint:
     name: Rust Lint
@@ -102,7 +101,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Format check
@@ -124,7 +123,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install cargo-nextest
@@ -148,7 +147,7 @@ jobs:
           fetch-depth: 2
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: desktop/src-tauri
           save-if: ${{ github.event_name != 'pull_request' }}
@@ -341,7 +340,7 @@ jobs:
           key: relay-artifacts-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'Dockerfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/ci.yml') }}
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
         with:
           workspaces: |
@@ -764,7 +763,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       # Reuse the relay + git-credential-nostr built by Desktop E2E Relay
@@ -892,8 +891,6 @@ jobs:
         with:
           path: ~/.pub-cache
           key: pub-${{ runner.os }}-${{ hashFiles('mobile/pubspec.lock') }}
-      - name: File size ratchet
-        run: node mobile/scripts/check-file-sizes.mjs
       - name: Format check
         run: cd mobile && dart format --output=none --set-exit-if-changed .
       - name: Analyze
@@ -955,7 +952,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: cross-${{ matrix.target }}
           save-if: ${{ github.event_name != 'pull_request' }}
@@ -996,7 +993,7 @@ jobs:
       # toolchain (1.95.0 + clippy via profile = default) comes from the
       # repo-root rust-toolchain.toml, which the runner's preinstalled rustup
       # honors on demand; the host triple already is x86_64-pc-windows-msvc.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             .
@@ -1073,7 +1070,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: desktop/src-tauri
           save-if: ${{ github.event_name != 'pull_request' }}
