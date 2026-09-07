@@ -28,6 +28,7 @@ import { useTauriWindowDrag } from "@/app/useTauriWindowDrag";
 import { useWebviewZoomShortcuts } from "@/app/useWebviewZoomShortcuts";
 import { useHuddlePresentation } from "@/app/useHuddlePresentation";
 import { shouldShowSidebarChannel } from "@/app/huddleChannelVisibility";
+import { recordSidebarRenderDiagnostic } from "@/features/channels/sidebarDiagnosticLog";
 import {
   channelsQueryKey,
   useChannelsQuery,
@@ -276,6 +277,31 @@ export function AppShell() {
       ),
     [huddleBackingChannelIds, memberChannels, revealedHuddleChannelIds],
   );
+  React.useEffect(() => {
+    const droppedByRenderFilter = channels
+      .filter((channel) => !sidebarChannels.some((c) => c.id === channel.id))
+      .map((channel) => ({
+        id: channel.id,
+        isMember: channel.isMember,
+        archived: channel.archivedAt !== null,
+        hiddenAsHuddleBacking:
+          huddleBackingChannelIds.has(channel.id) &&
+          !revealedHuddleChannelIds.has(channel.id),
+      }));
+    recordSidebarRenderDiagnostic({
+      ts: Date.now(),
+      queryChannelCount: channels.length,
+      memberChannelCount: memberChannels.length,
+      sidebarChannelCount: sidebarChannels.length,
+      droppedByRenderFilter,
+    });
+  }, [
+    channels,
+    huddleBackingChannelIds,
+    memberChannels,
+    revealedHuddleChannelIds,
+    sidebarChannels,
+  ]);
   const hasRestoredCommunityDestinationRef = React.useRef(false);
   React.useEffect(() => {
     const activeCommunityId = communitiesHook.activeCommunity?.id;
