@@ -709,17 +709,19 @@ export function useUpdateChannelMutation(channelId: string | null) {
       );
     },
     onSettled: (_data, _error, _variables, context) => {
-      // refetchType "none": onSuccess already cached the relay-returned detail;
-      // awaiting the full channel-list refetch kept the edit dialog stuck on
-      // "Saving..." (same failure #1360 fixed for create).
+      // Fire-and-forget (not awaited) so the edit dialog still closes
+      // immediately (#1360) — but unlike create/add-member, an update can
+      // land through a stale not-modified response racing this mutation's
+      // own optimistic patch (no other trigger corrects name/archivedAt
+      // until the next focused poll, which can be minutes away). Use the
+      // default refetchType so this still forces a real, immediate
+      // correcting refetch instead of only marking the cache stale.
       void queryClient.invalidateQueries({
         queryKey: channelsQueryKey,
-        refetchType: "none",
       });
       if (context?.channelId) {
         void queryClient.invalidateQueries({
           queryKey: channelDetailQueryKey(context.channelId),
-          refetchType: "none",
         });
       }
     },
