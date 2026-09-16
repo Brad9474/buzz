@@ -108,6 +108,49 @@ export function mentionsKnownAgent(
   );
 }
 
+/**
+ * Placeholder shown in the main composer dock. Ordered by priority so a
+ * channel that matches more than one reason (e.g. archived and no longer a
+ * member) still reports the more specific, longer-standing reason first.
+ */
+export function getMainComposerPlaceholder({
+  activeChannel,
+  directMessageDisplayName,
+  isModerationDmChannel,
+  timeoutActive,
+}: {
+  activeChannel: Pick<
+    Channel,
+    "archivedAt" | "channelType" | "isMember" | "name"
+  > | null;
+  directMessageDisplayName?: string | null;
+  isModerationDmChannel: boolean;
+  timeoutActive: boolean;
+}): string {
+  if (timeoutActive) {
+    return "You're timed out by community moderators.";
+  }
+  if (isModerationDmChannel) {
+    return "This channel is read-only.";
+  }
+  if (activeChannel?.archivedAt) {
+    return "Archived channels are read-only.";
+  }
+  if (activeChannel?.channelType === "forum") {
+    return "Forum posting is not wired in this pass.";
+  }
+  if (activeChannel && !activeChannel.isMember) {
+    return "You're not currently a member of this channel.";
+  }
+  if (!activeChannel) {
+    return "Select a channel";
+  }
+  if (activeChannel.channelType === "dm" && directMessageDisplayName) {
+    return `Message ${directMessageDisplayName}`;
+  }
+  return `Message #${activeChannel.name}`;
+}
+
 export function selectThreadComposerBotTypingPubkeys(
   entries: TypingIndicatorEntry[],
   threadHeadId: string | null,

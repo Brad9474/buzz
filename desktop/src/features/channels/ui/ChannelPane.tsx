@@ -51,6 +51,7 @@ import {
 } from "@/features/channels/ui/WelcomeComposerBanner";
 import { useWelcomeComposerBanner } from "@/features/channels/ui/useWelcomeComposerBanner";
 import {
+  getMainComposerPlaceholder,
   mentionsKnownAgent,
   selectThreadComposerBotTypingPubkeys,
   shouldPrioritizeIdleAuxiliary,
@@ -778,22 +779,13 @@ export const ChannelPane = React.memo(function ChannelPane({
                     onSend={handleSendMessage}
                     {...{ profiles, recentMentionPubkeys: recentMentions }}
                     showBackgroundUploadProgress={false}
-                    placeholder={
-                      timeoutState.active
-                        ? "You're timed out by community moderators."
-                        : isModerationDmChannel
-                          ? "This channel is read-only."
-                          : activeChannel?.archivedAt
-                            ? "Archived channels are read-only."
-                            : activeChannel?.channelType === "forum"
-                              ? "Forum posting is not wired in this pass."
-                              : activeChannel
-                                ? activeChannel.channelType === "dm" &&
-                                  directMessageIntro
-                                  ? `Message ${directMessageIntro.displayName}`
-                                  : `Message #${activeChannel.name}`
-                                : "Select a channel"
-                    }
+                    placeholder={getMainComposerPlaceholder({
+                      activeChannel,
+                      directMessageDisplayName:
+                        directMessageIntro?.displayName,
+                      isModerationDmChannel,
+                      timeoutActive: timeoutState.active,
+                    })}
                     showTopBorder={false}
                   />
                   <ChannelComposerActivityAccessory
