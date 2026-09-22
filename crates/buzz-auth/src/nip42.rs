@@ -16,6 +16,14 @@ use crate::error::AuthError;
 /// Uses the `url` crate for proper parsing rather than string manipulation.
 /// Normalizes localhost variants to 127.0.0.1 and strips trailing slashes
 /// (the `url` crate handles the latter automatically via path normalization).
+///
+/// **Excludes scheme**, same rationale as `nip98::normalize_url`: one relay
+/// process serves both loopback agents (`ws://127.0.0.1:...`, no TLS
+/// available on loopback) and clients arriving through a TLS-terminating hop
+/// such as Tailscale serve (`wss://...`). A single static deployment config
+/// can only predict one scheme, so the AUTH event's `relay` tag scheme can't
+/// be checked here without rejecting one of the two populations. Host and
+/// path are unaffected and still fail closed on mismatch.
 fn normalize_relay_url(raw: &str) -> String {
     let mut parsed = match Url::parse(raw) {
         Ok(u) => u,
@@ -29,7 +37,11 @@ fn normalize_relay_url(raw: &str) -> String {
     }
     let path = parsed.path().trim_end_matches('/').to_string();
     parsed.set_path(&path);
-    parsed.to_string()
+    let normalized = parsed.to_string();
+    normalized
+        .split_once("://")
+        .map(|(_scheme, rest)| rest.to_string())
+        .unwrap_or(normalized)
 }
 
 const TIMESTAMP_TOLERANCE_SECS: u64 = 60;
@@ -165,6 +177,22 @@ mod tests {
             verify_nip42_event(&event, &challenge, TEST_RELAY),
             Err(AuthError::RelayUrlMismatch)
         ));
+    }
+
+    /// Regression test for the 2026-09-21 pairing incident: a relay serving
+    /// both loopback agents and a Tailscale-terminated Desktop/mobile client
+    /// from one static config can only predict one scheme, so an AUTH event
+    /// signed with the *other* scheme (same host) must still verify.
+    #[test]
+    fn scheme_ignored_for_comparison() {
+        let keys = Keys::generate();
+        let challenge = generate_challenge();
+
+        let event = make_auth_event(&keys, &challenge, "wss://relay.example.com");
+        assert!(verify_nip42_event(&event, &challenge, "ws://relay.example.com").is_ok());
+
+        let event2 = make_auth_event(&keys, &challenge, "ws://relay.example.com");
+        assert!(verify_nip42_event(&event2, &challenge, "wss://relay.example.com").is_ok());
     }
 
     #[test]

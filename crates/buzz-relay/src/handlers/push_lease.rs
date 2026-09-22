@@ -199,7 +199,13 @@ pub fn validate_plaintext(body: &LeasePlaintext, limits: &LeaseLimits<'_>) -> Re
     if body.generation == 0 || body.generation > MAX_SAFE_JSON_INTEGER {
         return Err("generation must be a positive safe integer".into());
     }
-    if body.origin != limits.expected_origin {
+    // Scheme is intentionally excluded from this comparison — same rationale
+    // as `nip98::normalize_url`/`nip42::normalize_relay_url`: this relay
+    // serves both loopback agents (`ws`) and a Tailscale-terminated mobile
+    // client (`wss`) from one static `RELAY_URL` config, so `canonical_origin`
+    // can only ever predict one scheme. `strip_scheme` matches `expected_origin`
+    // by host only, the same way `buzz-media`'s Blossom auth already does.
+    if strip_scheme(&body.origin) != strip_scheme(limits.expected_origin) {
         return Err("origin mismatch".into());
     }
     check_string(&body.origin, limits.max_string_len)?;
@@ -568,6 +574,11 @@ fn class_rank(_: &str) -> u8 {
     1
 }
 
+/// Strip an optional `scheme://` prefix so origin comparison is authority-only.
+fn strip_scheme(value: &str) -> &str {
+    value.split_once("://").map(|(_, rest)| rest).unwrap_or(value)
+}
+
 fn canonical_origin(relay_url: &str, host: &str) -> Result<String, String> {
     let scheme = if relay_url.starts_with("wss://") {
         "wss"
@@ -729,6 +740,36 @@ mod tests {
         limits.max_h = 2;
         limits.max_tag_values = 1;
         assert!(validate_plaintext(&body, &limits).is_ok());
+    }
+
+    /// Regression test for the 2026-09-21 pairing incident: a relay serving
+    /// both loopback agents and a Tailscale-terminated mobile client can't
+    /// predict which scheme a lease's declared `origin` will use, so it must
+    /// still accept a match on host alone.
+    #[test]
+    fn origin_mismatch_ignores_scheme_but_not_host() {
+        let mut limits = limits();
+        limits.expected_origin = "wss://tenant.example";
+
+        let matching_host = parse_plaintext(
+            r##"{"v":1,"origin":"ws://tenant.example","generation":1,"active":false}"##,
+            1024,
+        )
+        .unwrap();
+        assert!(
+            validate_plaintext(&matching_host, &limits).is_ok(),
+            "ws-declared origin must match a wss-expected origin on the same host"
+        );
+
+        let wrong_host = parse_plaintext(
+            r##"{"v":1,"origin":"ws://other.example","generation":1,"active":false}"##,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_plaintext(&wrong_host, &limits).unwrap_err(),
+            "origin mismatch"
+        );
     }
 
     #[test]

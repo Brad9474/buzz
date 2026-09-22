@@ -3016,6 +3016,44 @@ mod postgres_tests {
         );
     }
 
+    /// Regression test for the 2026-09-21 pairing incident: this relay
+    /// serves loopback agents (`http`, no TLS on `127.0.0.1`) and a
+    /// Tailscale-terminated Desktop/mobile client (`https`) from the same
+    /// process. `state.config.relay_url` (`RELAY_URL`) can only ever hold
+    /// one scheme, so `nip98_expected_url` must not require the request's
+    /// scheme to match it — only host and path are load-bearing.
+    #[test]
+    fn verify_bridge_auth_accepts_nip98_event_whose_scheme_differs_from_config() {
+        let keys = Keys::generate();
+        let tenant = fresh_tenant("host-a.example");
+
+        // Client signed https; deployment config is still ws:// (the exact
+        // shape of tonight's incident: RELAY_URL unchanged after Desktop was
+        // pointed at a wss:// community).
+        let signed_url = "https://host-a.example/events";
+        let event_json = build_nip98_event_json(&keys, signed_url, "POST");
+        let headers = nip98_auth_headers(&event_json);
+        let expected_url = nip98_expected_url("ws://localhost:3000", &tenant, "/events");
+        assert_eq!(
+            expected_url, "http://host-a.example/events",
+            "sanity: config scheme ws:// must still derive http:// here"
+        );
+
+        verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
+            .expect("https-signed event must verify against an http-derived expected_url");
+
+        // Symmetric: loopback client signs http against a wss:// deployment config.
+        let keys2 = Keys::generate();
+        let signed_url2 = "http://host-a.example/events";
+        let event_json2 = build_nip98_event_json(&keys2, signed_url2, "POST");
+        let headers2 = nip98_auth_headers(&event_json2);
+        let expected_url2 = nip98_expected_url("wss://brads-laptop.tail46493b.ts.net", &tenant, "/events");
+        assert_eq!(expected_url2, "https://host-a.example/events");
+
+        verify_bridge_auth(&headers2, "POST", &expected_url2, Some(b""), true)
+            .expect("http-signed event must verify against an https-derived expected_url");
+    }
+
     /// Mirror of the query-reconstruction `authorize_moderation_read` performs
     /// before calling [`nip98_expected_url`], so the tests below pin the exact
     /// seam without a DB harness. Kept in lockstep with the production match arm.
