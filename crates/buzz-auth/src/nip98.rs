@@ -16,8 +16,9 @@
 //! 2. Verify `kind == 27235` (`Kind::HttpAuth`)
 //! 3. Verify Schnorr signature via `buzz_core::verify_event`
 //! 4. Verify `created_at` within ±60 seconds of server time
-//! 5. Verify `["u", <url>]` tag matches `expected_url` (normalised: case-insensitive
-//!    scheme/host, trailing slash stripped)
+//! 5. Verify `["u", <url>]` tag matches `expected_url` (normalised: scheme ignored,
+//!    case-insensitive host, trailing slash stripped — see [`normalize_url`] for why
+//!    scheme is excluded)
 //! 6. Verify `["method", <method>]` tag matches `expected_method` (case-insensitive)
 //! 7. If `["payload", <hash>]` tag is present **and** `body` is `Some`: verify
 //!    `SHA-256(body) == hex(payload_tag)`. This prevents body-substitution attacks.
@@ -179,8 +180,22 @@ pub fn verify_nip98_event(
 
 /// Normalize a URL for comparison.
 ///
-/// - Lowercases scheme and host (already done by the `url` crate).
+/// - Lowercases host (already done by the `url` crate).
 /// - Strips trailing slash from path.
+/// - **Excludes scheme.** A single Buzz relay process serves two client
+///   populations at once: loopback agent sessions (`http://127.0.0.1:...` —
+///   there is no TLS on loopback) and remote clients arriving through a
+///   TLS-terminating hop such as Tailscale serve (`https://...`). The
+///   deployment has exactly one static `expected_url` scheme to offer
+///   (`buzz-relay`'s `RELAY_URL` config), so whichever scheme it picks,
+///   requests signed with the other are legitimate and would otherwise be
+///   rejected. This isn't a security gap: cross-door replay is already
+///   blocked by the community+event-id replay guard (`nip98_replay.rs`,
+///   fail-closed), and host binding (below) is completely unaffected —
+///   only the scheme component is dropped from the match. In-repo
+///   precedent: `buzz-media`'s Blossom auth (`crates/buzz-media/src/auth.rs`,
+///   `normalize_server_host`) already compares authority only for the same
+///   reason.
 ///
 /// **No loopback aliasing.** `localhost`, `::1`, and `127.0.0.1` are three
 /// distinct hosts here. Under multi-tenant the `u`-tag host is the row-zero
@@ -196,7 +211,11 @@ fn normalize_url(raw: &str) -> String {
     };
     let path = parsed.path().trim_end_matches('/').to_string();
     parsed.set_path(&path);
-    parsed.to_string()
+    let normalized = parsed.to_string();
+    normalized
+        .split_once("://")
+        .map(|(_scheme, rest)| rest.to_string())
+        .unwrap_or(normalized)
 }
 
 #[cfg(test)]
@@ -325,6 +344,71 @@ mod tests {
         let json = make_nip98_event(&keys, TEST_URL, TEST_METHOD, None, None);
         let result = verify_nip98_event(&json, TEST_URL, TEST_METHOD, Some(b"some body"));
         assert!(result.is_ok());
+    }
+
+    /// Regression test for the 2026-09-21 pairing incident: a relay serving
+    /// both loopback agents and a Tailscale-terminated Desktop/mobile client
+    /// from one `RELAY_URL` config can only ever predict one scheme, so an
+    /// event signed with the *other* scheme (same host, same path) must
+    /// still verify. See `normalize_url`'s doc comment for the full reasoning
+    /// and the replay-guard backstop that keeps this safe.
+    #[test]
+    fn scheme_ignored_for_comparison() {
+        let keys = Keys::generate();
+
+        // Client signed https, server's static config would have expected http.
+        let json = make_nip98_event(
+            &keys,
+            "https://relay.example.com/api/tokens",
+            TEST_METHOD,
+            None,
+            None,
+        );
+        let result = verify_nip98_event(
+            &json,
+            "http://relay.example.com/api/tokens",
+            TEST_METHOD,
+            None,
+        );
+        assert!(result.is_ok(), "https-signed event must match an http expected_url on the same host+path: {:?}", result.err());
+
+        // Symmetric: client signed http (loopback), server expected https.
+        let json2 = make_nip98_event(
+            &keys,
+            "http://relay.example.com/api/tokens",
+            TEST_METHOD,
+            None,
+            None,
+        );
+        let result2 = verify_nip98_event(
+            &json2,
+            "https://relay.example.com/api/tokens",
+            TEST_METHOD,
+            None,
+        );
+        assert!(result2.is_ok(), "http-signed event must match an https expected_url on the same host+path: {:?}", result2.err());
+    }
+
+    /// Scheme is ignored, but host binding is not — a scheme mismatch must
+    /// never mask a genuine host mismatch (the row-44 multi-tenant obligation
+    /// `loopback_aliases_are_distinct_hosts` below protects).
+    #[test]
+    fn scheme_ignored_but_host_mismatch_still_rejected() {
+        let keys = Keys::generate();
+        let json = make_nip98_event(
+            &keys,
+            "https://host-a.example/api/tokens",
+            TEST_METHOD,
+            None,
+            None,
+        );
+        let result = verify_nip98_event(
+            &json,
+            "http://host-b.example/api/tokens",
+            TEST_METHOD,
+            None,
+        );
+        assert!(matches!(result, Err(AuthError::Nip98Invalid(_))));
     }
 
     #[test]
