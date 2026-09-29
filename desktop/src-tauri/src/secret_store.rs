@@ -1225,6 +1225,28 @@ pub struct PerKeyMigrationReport {
 mod tests {
     use super::*;
 
+    /// Deletes every named per-key credential (plus the index) on drop, so a
+    /// real-keyring test leaves nothing behind on the machine it ran on even
+    /// when an assertion panics partway through. Rust runs `Drop` impls
+    /// during an unwinding panic, which is what makes this safe as a cleanup
+    /// mechanism here — a plain "cleanup at the end of the function" line
+    /// never runs once a prior assertion has already panicked.
+    #[cfg(target_os = "windows")]
+    struct KeyringCleanupGuard<'a> {
+        store: &'a SecretStore,
+        names: Vec<String>,
+    }
+
+    #[cfg(target_os = "windows")]
+    impl Drop for KeyringCleanupGuard<'_> {
+        fn drop(&mut self) {
+            for n in &self.names {
+                let _ = self.store.per_key_delete(n);
+            }
+            let _ = self.store.per_key_delete(INDEX_KEY);
+        }
+    }
+
     // Test-only constructor: pre-seed the cache without touching the OS keychain.
     impl SecretStore {
         fn with_cache(service: &str, cache: Option<HashMap<String, String>>) -> Self {
@@ -1359,6 +1381,10 @@ mod tests {
     fn migrate_blob_to_per_key_moves_all_then_drops_blob() {
         let svc = "buzz-test-perkey-migration";
         let seed = SecretStore::keyring(svc);
+        let _cleanup = KeyringCleanupGuard {
+            store: &seed,
+            names: vec!["identity".into(), "agent:one".into(), "agent:two".into()],
+        };
         let _ = seed.per_key_delete(INDEX_KEY);
         for k in ["identity", "agent:one", "agent:two"] {
             let _ = seed.per_key_delete(k);
@@ -1403,10 +1429,7 @@ mod tests {
         assert_eq!(again.migrated, 0);
         assert!(!again.blob_removed);
 
-        for k in ["identity", "agent:one", "agent:two"] {
-            let _ = reader.delete(k);
-        }
-        let _ = reader.per_key_delete(INDEX_KEY);
+        // `_cleanup` drops here (and on any earlier panic).
     }
 
     /// Sign-out must remove the per-key credentials, not just the (now absent)
@@ -1417,6 +1440,10 @@ mod tests {
     fn sign_out_wipes_per_key_credentials_and_index() {
         let svc = "buzz-test-perkey-signout";
         let store = SecretStore::keyring(svc);
+        let _cleanup = KeyringCleanupGuard {
+            store: &store,
+            names: vec!["identity".into(), "agent:one".into()],
+        };
         store.store("identity", "nsec1identity").unwrap();
         store.store("agent:one", "nsec1one").unwrap();
 
@@ -1430,6 +1457,111 @@ mod tests {
             None,
             "the index itself must not survive sign-out"
         );
+    }
+
+    /// A legacy blob migrates off, then ten more agent keys are onboarded
+    /// through the live per-key `store()` path — combined, past the count
+    /// (nine) that made a single shared blob fail on real hardware. Each
+    /// individual per-key credential still writes and verifies fine, because
+    /// the per-key format never combines multiple secrets' bytes into one
+    /// credential the way the blob format did; that's the property this test
+    /// pins. Also covers a second boot: the migration must be a verified
+    /// no-op once the blob is already gone, and every key onboarded since
+    /// must still read back correctly.
+    ///
+    /// A real oversized blob can't be used to seed this test — the OS
+    /// credential API itself rejects a `set_password` over 2560 bytes
+    /// (confirmed by hitting exactly that error while drafting this test),
+    /// which is the same wall the legacy blob format hit in production. That
+    /// makes "seed a >2560-byte blob" an impossible precondition to construct
+    /// directly; what actually happened on real hardware was the *cumulative*
+    /// write growing past the cap one `store()` call at a time. This test
+    /// reproduces that by onboarding eleven keys one at a time and proving
+    /// their combined size would have exceeded the cap were they still going
+    /// into one blob, while every individual per-key write still succeeds.
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires real OS credential store (run with --ignored)"]
+    #[test]
+    fn migrate_then_onboard_ten_more_keys_exceeds_old_blob_cap_across_two_boots() {
+        // Unique per-test service name: this and every other real-keyring test
+        // in this module use their own `buzz-test-perkey-*` service, so none
+        // of them can collide with another test's credentials or with a real
+        // install's `buzz-desktop`/`buzz-desktop-dev` service.
+        let svc = "buzz-test-perkey-ten-keys";
+        let legacy_names = ["identity", "agent:legacy"];
+        let new_names: Vec<String> = (0..10).map(|i| format!("agent:{i}")).collect();
+        let all_names: Vec<String> = legacy_names
+            .iter()
+            .map(|s| s.to_string())
+            .chain(new_names.iter().cloned())
+            .collect();
+
+        let seed = SecretStore::keyring(svc);
+        // Guard constructed before any credential is written, and again after
+        // the store this test actually uses — so a panic anywhere below,
+        // including during seeding, still deletes everything named here.
+        let _cleanup = KeyringCleanupGuard {
+            store: &seed,
+            names: all_names.clone(),
+        };
+        for n in &all_names {
+            let _ = seed.per_key_delete(n);
+        }
+        let _ = seed.per_key_delete(INDEX_KEY);
+
+        // Seed a small pre-migration blob — realistic nsec-length values, well
+        // under the cap, representing the legacy stuck state.
+        let mut legacy = HashMap::new();
+        legacy.insert("identity".to_string(), format!("nsec1{}", "a".repeat(58)));
+        legacy.insert("agent:legacy".to_string(), format!("nsec1{}", "b".repeat(58)));
+        keyring_entry(svc, BLOB_KEY)
+            .unwrap()
+            .set_password(&serde_json::to_string(&legacy).unwrap())
+            .unwrap();
+
+        // First boot: migrate the legacy blob off.
+        let store = SecretStore::keyring(svc);
+        let first = store.migrate_blob_to_per_key().unwrap();
+        assert_eq!(first.migrated, 2);
+        assert!(first.blob_removed);
+
+        // Onboard ten more agent keys the normal way — one `store()` call
+        // per key, exactly as a real agent-add flow does. Every one must
+        // succeed individually even though...
+        let mut all_values = legacy.clone();
+        for n in &new_names {
+            let value = format!("nsec1{}{}", n, "c".repeat(230));
+            store.store(n, &value).unwrap();
+            all_values.insert(n.clone(), value);
+        }
+
+        // ...combined into one blob, as the pre-fix format would have,
+        // these twelve secrets clear the 2560-byte cap that broke real
+        // installs at the ninth key.
+        let combined_len = serde_json::to_string(&all_values).unwrap().len();
+        assert!(
+            combined_len > 2560,
+            "test setup must actually exceed the cap the legacy blob format hit ({combined_len} bytes)"
+        );
+
+        for (name, value) in &all_values {
+            assert_eq!(store.load(name).unwrap().as_ref(), Some(value));
+        }
+        assert!(store.read_blob_raw().unwrap().is_none());
+
+        // Second boot: nothing left to move — every key already lives in its
+        // own credential — and every key from both the legacy migration and
+        // the new onboarding still reads back correctly.
+        let reboot = SecretStore::keyring(svc);
+        let second = reboot.migrate_blob_to_per_key().unwrap();
+        assert_eq!(second.migrated, 0);
+        assert!(!second.blob_removed);
+        for (name, value) in &all_values {
+            assert_eq!(reboot.load(name).unwrap().as_ref(), Some(value));
+        }
+
+        // `_cleanup` drops here (and on any earlier panic), deleting every
+        // credential named in `all_names` plus the index.
     }
 
     // ── Cross-process race tests (require real OS keychain) ────────────────
