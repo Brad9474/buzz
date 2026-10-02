@@ -49,8 +49,10 @@ pub mod subscription;
 pub mod telemetry;
 /// Row-zero host binding: resolve the request community from the connection host.
 pub mod tenant;
-#[cfg(test)]
-mod test_support;
+/// Database-URL guard shared by this crate's internal tests and by the
+/// `buzz-relay` binary's own `#[cfg(test)]` code, which runs as a separate
+/// crate and so cannot reach a `#[cfg(test)]`-gated module here.
+pub mod test_support;
 /// Relay-side tunnel session directory and routing.
 pub mod tunnel;
 /// Webhook secret generation and constant-time comparison.

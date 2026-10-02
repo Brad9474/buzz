@@ -1,6 +1,6 @@
 //! Integration tests for community-scoped Postgres FTS.
 //!
-//! Run with a local PG: `BUZZ_TEST_DATABASE_URL=postgres://buzz:buzz_dev@localhost:5432/buzz cargo test -p buzz-search --tests -- --include-ignored`
+//! Run with a local PG: `BUZZ_TEST_DATABASE_URL=postgres://buzz:buzz_dev@localhost:5432/buzz_test cargo test -p buzz-search --tests -- --include-ignored`
 //!
 //! Each test creates a uniquely-named schema, applies every FTS-affecting
 //! migration in order, exercises a scenario, and drops it. Tests are
@@ -17,7 +17,31 @@ use buzz_search::{ChannelScope, SearchQuery, SearchService};
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
 use uuid::Uuid;
 
-const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+/// Resolve the database URL for this integration test.
+///
+/// `BUZZ_TEST_DATABASE_URL` is the only accepted source, and its database name
+/// must be disposable. Falling back to `DATABASE_URL` or a hardcoded default
+/// is the exact mechanism that let a test drop the live `public` schema on
+/// 2026-09-29 — do not reintroduce it, even though this file only ever drops
+/// its own uniquely-named schema, never `public`.
+fn test_database_url() -> String {
+    let url = std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| {
+        panic!(
+            "BUZZ_TEST_DATABASE_URL is not set. Set it to a disposable database, e.g. \
+             postgres://buzz:buzz_dev@localhost:5432/buzz_test"
+        )
+    });
+    let db_name = url.rsplit('/').next().unwrap_or_default();
+    let db_name = db_name.split(['?', '#']).next().unwrap_or(db_name);
+    assert!(
+        db_name.ends_with("_test") || db_name.starts_with("buzz_nt_"),
+        "refusing to run against database `{db_name}`: BUZZ_TEST_DATABASE_URL must resolve \
+         to a disposable database (name ending in `_test`, or a nextest-isolated `buzz_nt_*` \
+         database)"
+    );
+    url
+}
+
 const MIGRATION_0001_SQL: &str = include_str!("../../../migrations/0001_initial_schema.sql");
 const MIGRATION_0002_SQL: &str = include_str!("../../../migrations/0002_git_repo_names.sql");
 const MIGRATION_0003_SQL: &str = include_str!("../../../migrations/0003_community_icon.sql");
@@ -32,7 +56,7 @@ const MIGRATION_0033_SQL: &str =
     include_str!("../../../migrations/0033_private_managed_agent_fts.sql");
 
 async fn setup() -> (PgPool, String) {
-    let url = std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string());
+    let url = test_database_url();
     let schema = format!("fts_test_{}", Uuid::new_v4().simple());
     // Connect to the default schema first to create the test schema.
     let admin_pool = PgPoolOptions::new()
@@ -93,9 +117,7 @@ async fn teardown(pool: PgPool, schema: &str) {
     pool.close().await;
     let admin_pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string()),
-        )
+        .connect(&test_database_url())
         .await
         .expect("reconnect for drop");
     let drop_sql = format!("DROP SCHEMA \"{schema}\" CASCADE");

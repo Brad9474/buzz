@@ -13,6 +13,9 @@ use tracing::debug;
 use buzz_ws_client::NostrWsConnection;
 pub use buzz_ws_client::{parse_relay_message, OkResponse, RelayMessage, WsClientError};
 
+/// Database-URL guard shared by e2e/regression test binaries in `tests/`.
+pub mod test_support;
+
 /// Errors returned by [`BuzzTestClient`] operations.
 #[derive(Debug, Error)]
 pub enum TestClientError {

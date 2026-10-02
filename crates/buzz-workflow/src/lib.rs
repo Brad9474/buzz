@@ -1047,6 +1047,9 @@ fn trigger_matches_event(trigger: &TriggerDef, kind_u32: u32) -> bool {
 }
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod postgres_tests {
     use super::*;
 
@@ -1889,13 +1892,7 @@ steps:
     // -- SEC-006: event-path regression (requires Postgres) ----------------
 
     async fn setup_db() -> buzz_db::Db {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            // Local-only test default; this is not a production credential.
-            .unwrap_or_else(|_| {
-                let local_test_database = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-                local_test_database.to_owned()
-            });
+        let database_url = crate::test_support::database_url();
         buzz_db::Db::new(&buzz_db::DbConfig {
             database_url,
             ..Default::default()

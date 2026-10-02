@@ -2200,7 +2200,7 @@ mod tests {
     }
 
     async fn audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let database_url = buzz_relay::test_support::database_url();
         let pool = connect_audit_pool(&DbConfig {
             database_url,
             max_connections: 2,

@@ -542,6 +542,14 @@ impl Config {
             std::env::var("BUZZ_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
         let bind_addr = parse_bind_addr(&bind_addr_raw)?;
 
+        // Test builds never read DATABASE_URL here, full stop -- every relay
+        // unit test that constructs a Config (directly or via AppState) is
+        // guarded by this one choke point, including sites nobody has found
+        // yet. Chasing individual call sites that read DATABASE_URL a
+        // different way is why this needed fixing at the source instead.
+        #[cfg(test)]
+        let database_url = crate::test_support::database_url();
+        #[cfg(not(test))]
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
 

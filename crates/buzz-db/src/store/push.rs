@@ -1542,9 +1542,7 @@ mod postgres_tests {
     use tokio::sync::Barrier;
 
     async fn setup_pool() -> PgPool {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".into()); // sadscan:disable np.postgres.1 -- local test-only credentials
+        let database_url = crate::test_support::database_url();
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect to test DB");

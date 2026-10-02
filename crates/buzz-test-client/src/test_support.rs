@@ -1,11 +1,12 @@
-/// Resolve the database URL shared by PostgreSQL-backed unit tests.
-///
-/// `BUZZ_TEST_DATABASE_URL` is the only accepted source. Falling back to
-/// `DATABASE_URL` (or any other var, or a hardcoded default) is the exact
-/// mechanism that let a test drop the live `public` schema on 2026-09-29 —
-/// do not reintroduce it. See the incident briefing linked from
-/// `WORK_LOGS/RELAY_COMMUNITY_HOSTS_ROLLBACK.md`.
-pub(crate) fn database_url() -> String {
+//! Database-URL guard for the e2e/regression binaries under `tests/`.
+//!
+//! `BUZZ_TEST_DATABASE_URL` is the only accepted source. Falling back to
+//! `DATABASE_URL` (or any other var, or a hardcoded default) is the exact
+//! mechanism that let a test drop the live `public` schema on 2026-09-29 —
+//! do not reintroduce it.
+
+/// Resolve the database URL for Postgres-backed e2e/regression tests.
+pub fn database_url() -> String {
     let url = std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| {
         panic!(
             "BUZZ_TEST_DATABASE_URL is not set. PostgreSQL-backed tests refuse to fall \
@@ -21,17 +22,9 @@ pub(crate) fn database_url() -> String {
 /// Refuse a URL unless it points at a database this codebase treats as
 /// disposable: a name ending in `_test`, or one of nextest's per-test
 /// isolated `buzz_nt_*` databases (see `scripts/postgres-test-wrapper.sh`).
-pub(crate) fn assert_test_database_url(url: &str) {
+pub fn assert_test_database_url(url: &str) {
     let db_name = url.rsplit('/').next().unwrap_or_default();
     let db_name = db_name.split(['?', '#']).next().unwrap_or(db_name);
-    assert_disposable_test_database(db_name);
-}
-
-/// Same guard as [`assert_test_database_url`], applied to a bare database
-/// name (e.g. the result of `SELECT current_database()`) rather than a URL.
-/// Used as a second, connection-independent check right before destructive
-/// DDL — see `runtime::migration::reset_public_schema`.
-pub(crate) fn assert_disposable_test_database(db_name: &str) {
     assert!(
         db_name.ends_with("_test") || db_name.starts_with("buzz_nt_"),
         "refusing to run a PostgreSQL-backed test against database `{db_name}`: it must be \
@@ -40,8 +33,6 @@ pub(crate) fn assert_disposable_test_database(db_name: &str) {
     );
 }
 
-/// Pure string-logic tests — no Postgres, no env vars, no I/O of any kind.
-/// Safe to run at any time, including under the 2026-09-29 test-run freeze.
 #[cfg(test)]
 mod guard_tests {
     use super::*;
@@ -52,19 +43,11 @@ mod guard_tests {
         assert_test_database_url(
             "postgres://buzz:pw@localhost:5432/buzz_nt_deadbeefcafebabe1234?sslmode=disable",
         );
-        assert_disposable_test_database("buzz_test");
-        assert_disposable_test_database("buzz_nt_abc123");
     }
 
     #[test]
     #[should_panic(expected = "refusing to run")]
     fn rejects_the_live_database_name() {
         assert_test_database_url("postgres://buzz:buzz_dev@localhost:15432/buzz");
-    }
-
-    #[test]
-    #[should_panic(expected = "refusing to run")]
-    fn rejects_the_wiped_evidence_database_name() {
-        assert_disposable_test_database("buzz_wiped_20260929");
     }
 }
