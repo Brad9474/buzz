@@ -5,7 +5,11 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use sqlx::{Connection, PgPool};
 use uuid::Uuid;
 
-const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
+/// For `connect_lazy` only, which never dials the network — safe to use a
+/// syntactically-valid placeholder here without going through
+/// `crate::test_support::database_url()`'s disposable-database guard. Do not
+/// use this with any pool that will actually execute a query.
+const LAZY_ONLY_PLACEHOLDER_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials, never dialed
 
 type ConnectionCounters = std::collections::BTreeMap<(String, String, Option<String>), u64>;
 
@@ -65,7 +69,7 @@ fn connection_counter(
 }
 
 async fn setup_db() -> Db {
-    let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+    let database_url = crate::test_support::database_url();
     let pool = PgPool::connect(&database_url)
         .await
         .expect("connect to test DB");
@@ -647,7 +651,7 @@ async fn migration_schema_database_guard_covers_legacy_writer_and_nip09_deletion
 // the query instead of trusting the routing code's word for it.
 
 async fn admin_url() -> String {
-    std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into())
+    crate::test_support::database_url()
 }
 
 /// Create a fresh scratch database on the same server and optionally run migrations.
@@ -889,7 +893,7 @@ fn thread_cursor(reply: &crate::thread::ThreadReply) -> Vec<u8> {
 #[tokio::test]
 async fn read_falls_back_to_writer_when_no_replica_configured() {
     // Pure wiring test — connect_lazy never touches the network.
-    let pool = sqlx::PgPool::connect_lazy(TEST_DB_URL).expect("lazy pool");
+    let pool = sqlx::PgPool::connect_lazy(LAZY_ONLY_PLACEHOLDER_DB_URL).expect("lazy pool");
     let db = Db::from_pool(pool);
     assert!(!db.has_read_pool());
     assert!(
@@ -1015,11 +1019,11 @@ fn channel_cursor_predicate_is_not_budget_gated() {
 async fn read_pool_stats_reports_reader_ceiling_not_writer() {
     let writer = sqlx::postgres::PgPoolOptions::new()
         .max_connections(20)
-        .connect_lazy(TEST_DB_URL)
+        .connect_lazy(LAZY_ONLY_PLACEHOLDER_DB_URL)
         .expect("lazy writer pool");
     let reader = sqlx::postgres::PgPoolOptions::new()
         .max_connections(40)
-        .connect_lazy(TEST_DB_URL)
+        .connect_lazy(LAZY_ONLY_PLACEHOLDER_DB_URL)
         .expect("lazy reader pool");
     let db = Db::from_pools(writer, reader);
     assert_eq!(db.pool_stats().max, 20);

@@ -2124,12 +2124,9 @@ mod postgres_tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
 
     async fn setup_pool() -> PgPool {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let database_url = crate::test_support::database_url();
 
         PgPool::connect(&database_url)
             .await

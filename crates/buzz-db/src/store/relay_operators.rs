@@ -350,11 +350,9 @@ mod postgres_tests {
     use super::*;
     use sqlx::PgPool;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
 
     async fn setup_pool() -> PgPool {
-        let url =
-            std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string());
+        let url = crate::test_support::database_url();
         PgPool::connect(&url).await.expect("connect to test DB")
     }
 

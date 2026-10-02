@@ -194,13 +194,11 @@ mod postgres_tests {
         path::{Path, PathBuf},
     };
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     /// Connection parameters parsed out of a PostgreSQL URL so the parity test
     /// can pass them to the `bin/pgschema` binary, which
     /// takes discrete `--host/--port/--user/--password/--db` flags rather than a
-    /// URL. Only the shapes this test emits (`BUZZ_TEST_DATABASE_URL` /
-    /// `DATABASE_URL` / `TEST_DB_URL`) are supported.
+    /// URL. Only the shape `crate::test_support::database_url()` emits is
+    /// supported.
     struct PgConn {
         host: String,
         port: u16,
@@ -1931,9 +1929,7 @@ mod postgres_tests {
 
         // Dedicated database: the probe table and the orphaned backend must
         // stay invisible to concurrent tests in the shared database.
-        let base_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let base_url = crate::test_support::database_url();
         let admin = PgPool::connect(&base_url)
             .await
             .expect("connect admin database");
@@ -2087,16 +2083,27 @@ mod postgres_tests {
     }
 
     async fn connect_test_pool() -> PgPool {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let database_url = crate::test_support::database_url();
 
         PgPool::connect(&database_url)
             .await
             .expect("connect to test DB")
     }
 
+    /// Drops and recreates `public` on `pool`'s current database. This is the
+    /// exact operation that wiped the live database on 2026-09-29: a test
+    /// resolved its pool against `DATABASE_URL` (live) instead of a disposable
+    /// database. `connect_test_pool` now refuses that fallback, but this second,
+    /// connection-independent check runs immediately before the DROP regardless
+    /// of how `pool` was built, so a future caller can't reintroduce the bug by
+    /// constructing a pool a different way.
     async fn reset_public_schema(pool: &PgPool) {
+        let current_db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(pool)
+            .await
+            .expect("read current_database()");
+        crate::test_support::assert_disposable_test_database(&current_db);
+
         sqlx::query("DROP SCHEMA IF EXISTS public CASCADE")
             .execute(pool)
             .await
@@ -2188,9 +2195,7 @@ mod postgres_tests {
             .expect("read index shapes")
         }
 
-        let base_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let base_url = crate::test_support::database_url();
         let conn = parse_pg_url(&base_url);
         let admin = PgPool::connect(&base_url)
             .await
