@@ -203,6 +203,100 @@ fn migrate_reports_nothing_for_empty_key() {
     assert!(store.stored.borrow().is_empty());
 }
 
+/// Direct answer to the reported production failure: a key left inline in
+/// `managed-agents.json` because the ninth (or later) write into the shared
+/// Windows blob failed. This exercises `migrate_inline_key` against the real
+/// OS credential store (not `FakeKeyStore`) with ten other agent keys already
+/// present as their own credentials — past the count that broke the old
+/// single-blob format — and confirms the still-inline key now migrates.
+///
+/// This is NOT exercising `SecretStore::migrate_blob_to_per_key` (the
+/// blob→per-key migration added in `secret_store.rs`) — that function only
+/// ever touches secrets already inside the SecretStore's own shared blob. It
+/// has no knowledge of `managed-agents.json` at all. The mechanism that
+/// actually reads a cleartext key out of that file and clears it on the next
+/// save is this one, `migrate_inline_key`/`hydrate_keys`, which already
+/// existed on `main` before this fix and is already covered above against
+/// `FakeKeyStore`. What changed is that on Windows, `write_and_verify` now
+/// goes through the real `SecretStore` implementation of `KeyStore`, which
+/// after this fix writes each secret to its own credential — so this
+/// already-tested decision logic now succeeds past the old eight-key ceiling
+/// instead of returning `KeptInline` forever.
+#[cfg(target_os = "windows")]
+#[ignore = "requires real OS credential store (run with --ignored)"]
+#[test]
+fn migrate_inline_key_persists_past_the_old_blob_cap_on_real_keyring() {
+    /// Local panic-safe cleanup: deletes every named credential on drop, so
+    /// this leaves nothing behind on the real Credential Manager even if an
+    /// assertion below panics. Uses the public `delete()` rather than
+    /// `secret_store`'s private `per_key_delete` — this module is outside
+    /// that crate-private boundary.
+    struct CleanupGuard<'a> {
+        store: &'a crate::secret_store::SecretStore,
+        names: Vec<String>,
+    }
+    impl Drop for CleanupGuard<'_> {
+        fn drop(&mut self) {
+            for n in &self.names {
+                let _ = self.store.delete(n);
+            }
+            // Mirrors `secret_store::INDEX_KEY` (private to that module): the
+            // Windows per-key `store()` calls above mint this credential as a
+            // side effect, so it must be cleaned up too.
+            let _ = self.store.delete("keyindex");
+        }
+    }
+
+    let svc = "buzz-test-storage-inline-migration";
+    let store = crate::secret_store::SecretStore::keyring(svc);
+    let existing: Vec<String> = (0..10).map(|i| format!("agent:{i}")).collect();
+    let stuck_name = agent_keyring_name("agent-eleventh");
+    let all_names: Vec<String> = existing
+        .iter()
+        .cloned()
+        .chain(std::iter::once(stuck_name.clone()))
+        .collect();
+    let _cleanup = CleanupGuard {
+        store: &store,
+        names: all_names.clone(),
+    };
+
+    // Wipe any leftovers from a prior aborted run before seeding.
+    for n in &all_names {
+        let _ = store.delete(n);
+    }
+
+    // Simulate a machine that already has ten agent keys living in their own
+    // Windows credentials — the post-fix steady state, past the count that
+    // broke the old shared blob.
+    for n in &existing {
+        store
+            .store(n, &format!("nsec1{n}{}", "d".repeat(58)))
+            .unwrap();
+    }
+
+    // The eleventh key is the one still stuck inline in managed-agents.json,
+    // exactly the reported failure state: a record whose keyring write
+    // previously failed and whose plaintext copy was therefore kept.
+    let record = record_with_pubkey_and_key("agent-eleventh", "nsec1stuckinline");
+
+    let outcome = migrate_inline_key(&store, &record);
+
+    assert_eq!(
+        outcome,
+        KeyMigration::Persisted,
+        "the eleventh key must migrate cleanly now that each secret is its own credential, \
+         not combined into one capped blob"
+    );
+    assert_eq!(
+        store.load(&stuck_name).unwrap().as_deref(),
+        Some("nsec1stuckinline"),
+        "must read back from the real keyring, not just report success"
+    );
+
+    // `_cleanup` drops here (and on any earlier panic).
+}
+
 #[test]
 fn hydrate_fills_key_from_keyring_when_reachable() {
     // The normal keyring-backed case: an empty inline key is filled from

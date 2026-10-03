@@ -128,7 +128,93 @@ pub fn run_boot_migrations_after_reset(app: &tauri::AppHandle) {
     run_boot_migrations_inner(app, true);
 }
 
+/// Snapshot `managed-agents.json` before the very first Windows per-key
+/// migration attempt on this machine touches the keyring. Never overwritten
+/// once written, so it always reflects on-disk state immediately before the
+/// blob migration first ran here — a manual restore point on top of the
+/// read-back-verify-before-delete guarantee `migrate_blob_to_per_key` already
+/// gives the keyring side. The migration itself never writes this file; this
+/// is defence in depth, not a dependency of the migration's correctness.
+#[cfg(all(feature = "system-keyring", target_os = "windows"))]
+fn backup_managed_agents_before_first_migration(app: &tauri::AppHandle) {
+    let Ok(path) = crate::managed_agents::storage::managed_agents_store_path(app) else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let backup = path.with_extension("json.pre-perkey-migration.bak");
+    if backup.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::copy(&path, &backup) {
+        eprintln!(
+            "buzz-desktop: failed to back up managed-agents.json before per-key \
+             credential migration: {e}"
+        );
+    }
+}
+
+/// One-time move of every secret out of the shared keychain blob into its own
+/// Windows credential.
+///
+/// Windows caps a single credential at 2560 bytes. Packing every identity and
+/// agent key into one blob (the format every other platform still uses) hits
+/// that ceiling once the migrated set of keys is large enough — the write
+/// past the cap fails silently and the offending key never leaves cleartext
+/// in `managed-agents.json`. `SecretStore` on Windows already treats a
+/// per-key credential as the live format and only reads the blob as a
+/// not-yet-migrated fallback (see the "Windows per-key credential store"
+/// section of `secret_store.rs`); this call is what actually performs that
+/// move instead of leaving every key to be migrated lazily one `store()` call
+/// at a time.
+///
+/// Non-fatal and safe to run every boot: `migrate_blob_to_per_key` writes and
+/// read-back-verifies every key under its own credential before it deletes
+/// the blob, so a failure partway through leaves the blob intact and this
+/// simply retries next boot. Once the blob is gone the call is a fast no-op
+/// (`Ok(report) if !report.blob_removed`).
+#[cfg(all(feature = "system-keyring", target_os = "windows"))]
+fn migrate_windows_credential_blob(app: &tauri::AppHandle) {
+    backup_managed_agents_before_first_migration(app);
+    let store = crate::secret_store::SecretStore::shared(crate::app_state::keyring_service());
+    match store.migrate_blob_to_per_key() {
+        Ok(report) if report.blob_removed => {
+            eprintln!(
+                "buzz-desktop: migrated {} secret(s) out of the shared keychain blob into \
+                 per-key Windows credentials",
+                report.migrated
+            );
+        }
+        Ok(_) => {
+            // Nothing to migrate — blob was already empty/absent (steady
+            // state, or a fresh install with no legacy blob at all).
+        }
+        Err(e) => {
+            eprintln!(
+                "buzz-desktop: windows per-key credential migration failed, \
+                 blob left intact, will retry next boot: {e}"
+            );
+        }
+    }
+}
+
+#[cfg(not(all(feature = "system-keyring", target_os = "windows")))]
+fn migrate_windows_credential_blob(_app: &tauri::AppHandle) {}
+
 fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
+    // Windows-only, independent of the nest/app-data-dir and of identity
+    // resolution: moves every secret in the shared keychain blob into its own
+    // credential before anything else touches the keyring this boot. Not a
+    // correctness precondition — `SecretStore::load`/`probe` already fall back
+    // to the blob for a not-yet-migrated key — but running it first keeps the
+    // blob from ever being written to again after this boot (identity
+    // resolution and agent restore both call `SecretStore::store`, and a write
+    // through the old blob path while keys are still split between the blob
+    // and per-key credentials is exactly the partial-migration shape the
+    // ordering here avoids).
+    migrate_windows_credential_blob(app);
+
     // Initialize the process-lifetime nest directory before filesystem access
     // that calls nest_dir(). The discriminator matches reconcile_target_dir:
     // dev instances have an app-data-dir name starting with CANONICAL_DEV_IDENTIFIER.
