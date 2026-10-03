@@ -3419,9 +3419,7 @@ mod postgres_tests {
     use crate::{CreateCommunityWithOwnerResult, Db, DbConfig};
 
     async fn store() -> (Db, DeletionStore) {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1 -- local test-only credentials
+        let database_url = crate::test_support::database_url();
         let db = Db::new(&DbConfig {
             database_url,
             max_connections: 5,
@@ -4699,9 +4697,7 @@ mod postgres_tests {
         // scenario in a dedicated database so concurrent purge/verify tests
         // never observe the drifted surface; advisory locks are also
         // per-database, so the parked migration lock cannot stall them.
-        let base_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        let base_url = crate::test_support::database_url();
         let admin = PgPool::connect(&base_url)
             .await
             .expect("connect admin database");
@@ -4884,9 +4880,7 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn desired_state_schema_bootstrap_progresses_beyond_fencing() {
-        let base_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        let base_url = crate::test_support::database_url();
         let admin = PgPool::connect(&base_url)
             .await
             .expect("connect admin database");

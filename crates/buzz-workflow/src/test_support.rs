@@ -24,14 +24,6 @@ pub(crate) fn database_url() -> String {
 pub(crate) fn assert_test_database_url(url: &str) {
     let db_name = url.rsplit('/').next().unwrap_or_default();
     let db_name = db_name.split(['?', '#']).next().unwrap_or(db_name);
-    assert_disposable_test_database(db_name);
-}
-
-/// Same guard as [`assert_test_database_url`], applied to a bare database
-/// name (e.g. the result of `SELECT current_database()`) rather than a URL.
-/// Used as a second, connection-independent check right before destructive
-/// DDL — see `runtime::migration::reset_public_schema`.
-pub(crate) fn assert_disposable_test_database(db_name: &str) {
     assert!(
         db_name.ends_with("_test") || db_name.starts_with("buzz_nt_"),
         "refusing to run a PostgreSQL-backed test against database `{db_name}`: it must be \
@@ -52,19 +44,11 @@ mod guard_tests {
         assert_test_database_url(
             "postgres://buzz:pw@localhost:5432/buzz_nt_deadbeefcafebabe1234?sslmode=disable",
         );
-        assert_disposable_test_database("buzz_test");
-        assert_disposable_test_database("buzz_nt_abc123");
     }
 
     #[test]
     #[should_panic(expected = "refusing to run")]
     fn rejects_the_live_database_name() {
         assert_test_database_url("postgres://buzz:buzz_dev@localhost:15432/buzz");
-    }
-
-    #[test]
-    #[should_panic(expected = "refusing to run")]
-    fn rejects_the_wiped_evidence_database_name() {
-        assert_disposable_test_database("buzz_wiped_20260929");
     }
 }

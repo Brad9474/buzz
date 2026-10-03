@@ -571,14 +571,11 @@ mod postgres_tests {
     use super::*;
     use sqlx::{postgres::PgPoolOptions, AssertSqlSafe};
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- fixed localhost-only test credential
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL with CREATEDB/CREATEROLE"]
     async fn cluster_global_readiness_requires_migrated_schema_dml_and_no_ddl() {
-        let admin_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let admin_url = crate::test_support::database_url();
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&admin_url)
@@ -688,9 +685,7 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires PostgreSQL"]
     async fn reaper_retains_revocation_tombstones_until_authority_expiry() {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let database_url = crate::test_support::database_url();
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)
@@ -817,9 +812,7 @@ mod postgres_tests {
     // exercises the real PK/UNIQUE replay fences that the memory store's single
     // mutex cannot. Returns (pool, schema) for teardown.
     async fn full_schema(max_connections: u32) -> (PgPool, String) {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let database_url = crate::test_support::database_url();
         let schema = format!("push_admit_{}", Uuid::new_v4().simple());
         let bootstrap = PgPoolOptions::new()
             .max_connections(1)
@@ -1279,9 +1272,7 @@ mod postgres_tests {
     }
 
     async fn drop_schema(schema: &str) {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        let database_url = crate::test_support::database_url();
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)

@@ -143,11 +143,9 @@ mod postgres_tests {
     use sqlx::PgPool;
     use uuid::Uuid;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
 
     async fn setup_db() -> Db {
-        let database_url =
-            std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+        let database_url = crate::test_support::database_url();
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect to test DB");

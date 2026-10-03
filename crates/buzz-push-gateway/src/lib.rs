@@ -9,5 +9,7 @@ pub mod metrics;
 pub mod model;
 pub mod postgres;
 pub(crate) mod strict_json;
+#[cfg(test)]
+mod test_support;
 pub mod token;
 pub use http::{router, router_with_metrics, AppState};

@@ -84,6 +84,13 @@ pub struct UnarchivedCommunityRecord {
 impl Db {
     /// Returns the community mapped to a normalized request host, if one exists.
     ///
+    /// Checks the community's canonical host (`communities.host`) first, then
+    /// falls back to its registered alias hosts (`community_hosts`) — a
+    /// Tailscale name, a LAN IP, a loopback address, anything that reaches the
+    /// same deployment under a different hostname. A `guard_*_host_collision`
+    /// trigger on both tables guarantees a host is never both at once, so the
+    /// two branches below are mutually exclusive by construction, not by luck.
+    ///
     /// The caller owns host normalization and turns `None` into the fail-closed
     /// request/connection error. buzz-db only reads the durable host map.
     #[datastore_span(name = "lookup_community_by_host", system = "postgresql")]
@@ -98,12 +105,21 @@ impl Db {
         .await?;
         let row = sqlx::query(
             r#"
-            SELECT id, host
-            FROM communities
-            WHERE lower(host) = lower($1)
-              AND archived_at IS NULL
-              AND deleted_at IS NULL
-              AND deletion_state = 'active'
+            SELECT c.id, c.host
+            FROM communities c
+            WHERE lower(c.host) = lower($1)
+              AND c.archived_at IS NULL
+              AND c.deleted_at IS NULL
+              AND c.deletion_state = 'active'
+            UNION ALL
+            SELECT c.id, c.host
+            FROM community_hosts ch
+            JOIN communities c ON c.id = ch.community_id
+            WHERE lower(ch.host) = lower($1)
+              AND c.archived_at IS NULL
+              AND c.deleted_at IS NULL
+              AND c.deletion_state = 'active'
+            LIMIT 1
             "#,
         )
         .bind(normalized_host)
@@ -807,6 +823,83 @@ mod postgres_tests {
             .expect("lookup stored-case host")
             .expect("community found by stored-case host");
         assert_eq!(found.id, CommunityId::from_uuid(id));
+    }
+
+    /// Reproduces the pairing 404: a community reachable under a second
+    /// hostname (e.g. a Tailscale name) that was never its canonical host.
+    /// Registering the second host in `community_hosts` must be enough for
+    /// `lookup_community_by_host` to resolve it — this is the exact fallback
+    /// that was missing, leaving a live `community_hosts` row unused.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn lookup_community_by_host_resolves_registered_alias_host() {
+        let db = setup_db().await;
+        let id = Uuid::new_v4();
+        let canonical_host = format!("alias-canonical-{}.example", id.simple());
+        let alias_host = format!("alias-secondary-{}.example", id.simple());
+
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(&canonical_host)
+            .execute(&db.pool)
+            .await
+            .expect("insert community with canonical host");
+
+        assert!(
+            db.lookup_community_by_host(&alias_host)
+                .await
+                .expect("lookup unregistered alias host")
+                .is_none(),
+            "alias host must fail closed before it is registered"
+        );
+
+        sqlx::query("INSERT INTO community_hosts (community_id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(&alias_host)
+            .execute(&db.pool)
+            .await
+            .expect("register alias host");
+
+        let found = db
+            .lookup_community_by_host(&alias_host)
+            .await
+            .expect("lookup alias host")
+            .expect("community found by alias host");
+        assert_eq!(found.id, CommunityId::from_uuid(id));
+
+        // The canonical host must still resolve too — the alias is additive.
+        let found = db
+            .lookup_community_by_host(&canonical_host)
+            .await
+            .expect("lookup canonical host")
+            .expect("community found by canonical host");
+        assert_eq!(found.id, CommunityId::from_uuid(id));
+
+        // An unmapped host is still rejected — the fallback isn't a wildcard.
+        assert!(
+            db.lookup_community_by_host(&format!("nowhere-{}.example", id.simple()))
+                .await
+                .expect("lookup unmapped host")
+                .is_none()
+        );
+
+        // DATABASE_URL for this test suite points at the same dev/live Postgres
+        // the relay itself reads from (no disposable per-test database) — clean
+        // up explicitly so this test doesn't leave a permanent fake community
+        // behind on every run. community_hosts must be deleted before communities:
+        // ON DELETE CASCADE fires community_write_fence_community_hosts after the
+        // parent row is already gone in the same command, which the fence reads
+        // as "community is missing" and rejects.
+        sqlx::query("DELETE FROM community_hosts WHERE community_id = $1")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .expect("clean up test alias host");
+        sqlx::query("DELETE FROM communities WHERE id = $1")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .expect("clean up test community");
     }
 
     #[tokio::test]
