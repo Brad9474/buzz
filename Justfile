@@ -210,6 +210,27 @@ _ensure-migrations: _ensure-services
     cargo run -p buzz-admin -- migrate
     ./scripts/seed-local-community.sh
 
+# Apply migrations to the Postgres-backed test database ONLY -- never DATABASE_URL.
+# BUZZ_TEST_DATABASE_URL must be set and must name a disposable database
+# (`*_test` or a nextest-isolated `buzz_nt_*`). This is the guard that was
+# missing when run-tests.sh's integration-test bootstrap migrated whatever
+# DATABASE_URL pointed to and dropped the live production schema on
+# 2026-09-29 -- see crates/buzz-relay/src/test_support.rs.
+_ensure-test-migrations: _ensure-services
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${BUZZ_TEST_DATABASE_URL:?BUZZ_TEST_DATABASE_URL must be set to a disposable test database, e.g. postgres://buzz:buzz_dev@localhost:5432/buzz_test}"
+    db_name="${BUZZ_TEST_DATABASE_URL##*/}"
+    db_name="${db_name%%\?*}"
+    case "$db_name" in
+        *_test|buzz_nt_*) ;;
+        *)
+            echo "refusing to migrate database '$db_name': it must be disposable (name ending in _test, or a nextest-isolated buzz_nt_* database) -- this is the guard that was missing on 2026-09-29" >&2
+            exit 1
+            ;;
+    esac
+    DATABASE_URL="$BUZZ_TEST_DATABASE_URL" cargo run -p buzz-admin -- migrate
+
 # Run clippy on the desktop Tauri Rust crate
 # Features are additive, so a single invocation lints only one cfg graph.
 # Both graphs ship (release-windows builds without mesh-llm), so lint both:

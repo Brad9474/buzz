@@ -1524,7 +1524,7 @@ pub(crate) mod tests {
     }
 
     async fn audit_worker_retries_lock_timeout_until_original_entry_is_appended_once() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let database_url = crate::test_support::database_url();
         let observer = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect observer pool");

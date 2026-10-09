@@ -70,7 +70,20 @@ run_test_step() {
 # ---- Check / start infra (for integration tests) ----------------------------
 
 ensure_infra() {
-  "${REPO_ROOT}/bin/just" _ensure-migrations
+  # _ensure-test-migrations migrates BUZZ_TEST_DATABASE_URL only, and refuses
+  # any database that isn't disposable (*_test or buzz_nt_*). Do not switch
+  # this back to _ensure-migrations: that recipe migrates whatever
+  # DATABASE_URL resolves to, which is what dropped the live production
+  # schema on 2026-09-29 when this script ran against it.
+  "${REPO_ROOT}/bin/just" _ensure-test-migrations
+
+  # Safety net, not the guard itself: _ensure-test-migrations already refused
+  # above unless BUZZ_TEST_DATABASE_URL is set and disposable. Re-point
+  # DATABASE_URL at that same disposable value for the rest of this run, so a
+  # call site that reads DATABASE_URL directly and hasn't been found and
+  # routed through test_support::database_url() yet lands on the test
+  # database instead of silently falling through to production.
+  export DATABASE_URL="${BUZZ_TEST_DATABASE_URL}"
 }
 
 # ---- Unit tests (no infra needed) -------------------------------------------

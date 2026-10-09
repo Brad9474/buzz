@@ -28,7 +28,7 @@ fn host() -> String {
     std::env::var("REPRO_HOST").unwrap_or_else(|_| "localhost:3999".into())
 }
 fn db_url() -> String {
-    std::env::var("DATABASE_URL").expect("DATABASE_URL required")
+    buzz_test_client::test_support::database_url()
 }
 
 fn sha256_hex(b: &[u8]) -> String {

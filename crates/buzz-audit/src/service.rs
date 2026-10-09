@@ -286,8 +286,7 @@ mod postgres_tests {
     }
 
     async fn test_pool() -> Option<PgPool> {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".into()); // sadscan:disable np.postgres.1 -- local test fixture
+        let url = crate::test_support::database_url();
         PgPool::connect(&url).await.ok()
     }
 

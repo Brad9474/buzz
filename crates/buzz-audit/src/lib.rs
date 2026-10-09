@@ -27,6 +27,8 @@ pub mod error;
 pub mod hash;
 /// Audit log service — append and verify entries.
 pub mod service;
+#[cfg(test)]
+mod test_support;
 
 pub use action::AuditAction;
 pub use entry::{AuditEntry, NewAuditEntry};

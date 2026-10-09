@@ -3,9 +3,8 @@
 /// `BUZZ_TEST_DATABASE_URL` is the only accepted source. Falling back to
 /// `DATABASE_URL` (or any other var, or a hardcoded default) is the exact
 /// mechanism that let a test drop the live `public` schema on 2026-09-29 —
-/// do not reintroduce it. See the incident briefing linked from
-/// `WORK_LOGS/RELAY_COMMUNITY_HOSTS_ROLLBACK.md`.
-pub(crate) fn database_url() -> String {
+/// do not reintroduce it.
+pub fn database_url() -> String {
     let url = std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| {
         panic!(
             "BUZZ_TEST_DATABASE_URL is not set. PostgreSQL-backed tests refuse to fall \
@@ -21,7 +20,7 @@ pub(crate) fn database_url() -> String {
 /// Refuse a URL unless it points at a database this codebase treats as
 /// disposable: a name ending in `_test`, or one of nextest's per-test
 /// isolated `buzz_nt_*` databases (see `scripts/postgres-test-wrapper.sh`).
-pub(crate) fn assert_test_database_url(url: &str) {
+pub fn assert_test_database_url(url: &str) {
     let db_name = url.rsplit('/').next().unwrap_or_default();
     let db_name = db_name.split(['?', '#']).next().unwrap_or(db_name);
     assert!(
