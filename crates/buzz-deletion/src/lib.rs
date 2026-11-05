@@ -1602,6 +1602,9 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 }
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod postgres_tests {
     use super::*;
 
@@ -1653,9 +1656,7 @@ mod postgres_tests {
     }
 
     async fn claimed_test_deletion(prefix: &str) -> (Db, Services, ClaimedDeletion) {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .expect("BUZZ_TEST_DATABASE_URL or DATABASE_URL is required");
+        let database_url = crate::test_support::database_url();
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect deletion engine test DB");
@@ -2182,9 +2183,7 @@ mod postgres_tests {
     #[ignore = "requires Postgres"]
     async fn stale_lease_during_failure_recording_is_lost_ownership() {
         let (_, services, claim) = claimed_test_deletion("deletion-stale-record").await;
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .expect("test database URL");
+        let database_url = crate::test_support::database_url();
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect stale-record test DB");
@@ -2268,9 +2267,7 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn serving_guard_cancels_protected_operation_when_heartbeat_is_lost() {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .expect("BUZZ_TEST_DATABASE_URL or DATABASE_URL is required");
+        let database_url = crate::test_support::database_url();
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect serving guard test DB");

@@ -1372,9 +1372,7 @@ mod postgres_tests {
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
     async fn persistence_test_context() -> (buzz_db::Db, TenantContext) {
-        let url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1 -- local test-only credentials
+        let url = crate::test_support::database_url();
         let pool = sqlx::PgPool::connect(&url)
             .await
             .expect("connect workflow persistence test database");
